@@ -55,6 +55,7 @@ def _install_import_stubs() -> None:
 _install_import_stubs()
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
+INTEGRATION = importlib.import_module("custom_components.unifi_device_card")
 API = importlib.import_module("custom_components.unifi_device_card.websocket_api")
 
 
@@ -102,6 +103,27 @@ class FakeConfigEntries:
 
     def async_loaded_entries(self, domain):
         return self.entries if domain == "unifi" else []
+
+
+class IntegrationSetupTests(unittest.IsolatedAsyncioTestCase):
+    """Verify the integration registers its WebSocket command."""
+
+    async def test_registers_command_after_loading_local_websocket_module(self):
+        registered = []
+        ha_websocket_api = sys.modules["homeassistant.components.websocket_api"]
+        original_register = ha_websocket_api.async_register_command
+        ha_websocket_api.async_register_command = (
+            lambda hass, handler: registered.append((hass, handler))
+        )
+        hass = types.SimpleNamespace(data={})
+
+        try:
+            result = await INTEGRATION.async_setup(hass, {})
+        finally:
+            ha_websocket_api.async_register_command = original_register
+
+        self.assertTrue(result)
+        self.assertEqual(registered, [(hass, API.websocket_get_port_clients)])
 
 
 class WebsocketMappingTests(unittest.TestCase):

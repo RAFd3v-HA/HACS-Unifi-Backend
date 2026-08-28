@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components import websocket_api
+from homeassistant.components import websocket_api as ha_websocket_api
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
@@ -15,7 +15,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the read-only frontend API."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     if not domain_data.get(DATA_WEBSOCKET_REGISTERED):
-        websocket_api.async_register_command(hass, websocket_get_port_clients)
+        ha_websocket_api.async_register_command(hass, websocket_get_port_clients)
         domain_data[DATA_WEBSOCKET_REGISTERED] = True
     return True
 
