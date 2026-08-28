@@ -1,0 +1,9 @@
+{
+  "title": "UniFi Device Card Backend",
+  "config": {
+    "abort": {
+      "already_configured": "Das UniFi Device Card Backend ist bereits eingerichtet.",
+      "unifi_not_configured": "Richte zuerst die offizielle UniFi-Network-Integration von Home Assistant ein."
+    }
+  }
+}
