@@ -8,14 +8,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DATA_WEBSOCKET_REGISTERED, DOMAIN
-from .websocket_api import websocket_get_port_clients
+from .websocket_api import websocket_get_port_clients, websocket_set_etherlighting
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register the read-only frontend API."""
+    """Register the frontend topology and optional control APIs."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     if not domain_data.get(DATA_WEBSOCKET_REGISTERED):
         ha_websocket_api.async_register_command(hass, websocket_get_port_clients)
+        ha_websocket_api.async_register_command(hass, websocket_set_etherlighting)
         domain_data[DATA_WEBSOCKET_REGISTERED] = True
     return True
 

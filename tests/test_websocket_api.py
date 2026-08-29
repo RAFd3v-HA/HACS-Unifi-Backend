@@ -1,4 +1,4 @@
-"""Unit tests for the read-only UniFi mapping endpoint.
+"""Unit tests for the UniFi mapping endpoint and guarded controls.
 
 These tests use small Home Assistant stubs so the pure mapping behavior can be
 verified without installing Home Assistant in the repository build job.
@@ -19,10 +19,17 @@ def _install_import_stubs() -> None:
     """Install only the symbols imported by the integration modules."""
     voluptuous = types.ModuleType("voluptuous")
     voluptuous.Required = lambda key: key
+    voluptuous.Optional = lambda key: key
     sys.modules["voluptuous"] = voluptuous
 
     websocket_api = types.ModuleType("homeassistant.components.websocket_api")
     websocket_api.websocket_command = lambda schema: (lambda function: function)
+    websocket_api.require_admin = lambda function: (
+        setattr(function, "_requires_admin", True) or function
+    )
+    websocket_api.async_response = lambda function: (
+        setattr(function, "_async_response", True) or function
+    )
     websocket_api.async_register_command = lambda hass, handler: None
     websocket_api.ActiveConnection = object
 
@@ -84,9 +91,10 @@ class FakeHandler(dict):
 class FakeConnection:
     """Capture the WebSocket result or error."""
 
-    def __init__(self):
+    def __init__(self, is_admin=True):
         self.result = None
         self.error = None
+        self.user = types.SimpleNamespace(is_admin=is_admin)
 
     def send_result(self, message_id, result):
         self.result = (message_id, result)
@@ -123,7 +131,15 @@ class IntegrationSetupTests(unittest.IsolatedAsyncioTestCase):
             ha_websocket_api.async_register_command = original_register
 
         self.assertTrue(result)
-        self.assertEqual(registered, [(hass, API.websocket_get_port_clients)])
+        self.assertEqual(
+            registered,
+            [
+                (hass, API.websocket_get_port_clients),
+                (hass, API.websocket_set_etherlighting),
+            ],
+        )
+        self.assertTrue(API.websocket_set_etherlighting._requires_admin)
+        self.assertTrue(API.websocket_set_etherlighting._async_response)
 
 
 class WebsocketMappingTests(unittest.TestCase):
@@ -257,6 +273,159 @@ class WebsocketMappingTests(unittest.TestCase):
 
         self.assertTrue(connection.result[1]["mesh"]["is_mesh"])
         self.assertEqual(connection.result[1]["mesh"]["signal_dbm"], -46)
+
+    def test_does_not_infer_mesh_from_a_wired_uplink_mac(self):
+        device_mac = "aa:bb:cc:00:00:03"
+        device = FakeItem(
+            {
+                "mac": device_mac,
+                "port_table": [],
+                "uplink": {
+                    "type": "wire",
+                    "rssi": 46,
+                    "uplink_mac": "aa:bb:cc:00:00:04",
+                },
+            }
+        )
+        api = types.SimpleNamespace(
+            devices=FakeHandler({device_mac: device}),
+            clients=FakeHandler(),
+            object_oriented_network_configs=FakeHandler(),
+        )
+        hub = types.SimpleNamespace(
+            api=api,
+            available=True,
+            site="default",
+            config=types.SimpleNamespace(option_detection_time=timedelta(minutes=5)),
+        )
+        entry = types.SimpleNamespace(entry_id="unifi-entry", title="Home", runtime_data=hub)
+        hass = types.SimpleNamespace(config_entries=FakeConfigEntries([entry]))
+        connection = FakeConnection()
+
+        API.websocket_get_port_clients(hass, connection, {"id": 13, "device_mac": device_mac})
+
+        self.assertFalse(connection.result[1]["mesh"]["is_mesh"])
+        self.assertIsNone(connection.result[1]["mesh"]["signal_dbm"])
+
+    def test_etherlighting_write_validation_is_strict(self):
+        self.assertIsNone(API._etherlighting_patch({"brightness": True}))
+        self.assertIsNone(API._etherlighting_patch({"brightness": 80.5}))
+        self.assertIsNone(API._etherlighting_patch({"brightness": "80"}))
+        self.assertEqual(API._etherlighting_patch({"brightness": 80}), {"brightness": 80})
+        self.assertFalse(API._is_unifi_admin(types.SimpleNamespace()))
+        self.assertFalse(API._is_unifi_admin(types.SimpleNamespace(is_admin=None)))
+        self.assertTrue(API._is_unifi_admin(types.SimpleNamespace(is_admin=True)))
+
+        alias_only = FakeItem(
+            {
+                "mac": "aa:bb:cc:00:00:09",
+                "type": "usw",
+                "etherlighting": {
+                    "led_mode": "standard",
+                    "mode": "speed",
+                    "behavior": "steady",
+                    "brightness": 80,
+                },
+            }
+        )
+        self.assertIsNone(API._etherlighting_mapping(alias_only))
+
+    def test_exposes_and_updates_supported_etherlighting(self):
+        device_mac = "aa:bb:cc:00:00:01"
+        device = FakeItem(
+            {
+                "mac": device_mac,
+                "device_id": "device-id-1",
+                "type": "usw",
+                "port_table": [],
+                "ether_lighting": {
+                    "led_mode": "standard",
+                    "mode": "speed",
+                    "behavior": "steady",
+                    "brightness": 60,
+                    "future_field": "preserved",
+                },
+            }
+        )
+
+        class RequestApi:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request):
+                self.requests.append(request)
+                if request.method == "put" and isinstance(request.data, dict):
+                    device.raw.update(request.data)
+                return {"data": [dict(device.raw)]}
+
+        api = RequestApi()
+        api.devices = FakeHandler({device_mac: device})
+        api.clients = FakeHandler()
+        api.object_oriented_network_configs = FakeHandler()
+        hub = types.SimpleNamespace(
+            api=api,
+            available=True,
+            is_admin=True,
+            site="default",
+            config=types.SimpleNamespace(option_detection_time=timedelta(minutes=5)),
+        )
+        entry = types.SimpleNamespace(entry_id="unifi-entry", title="Home", runtime_data=hub)
+        hass = types.SimpleNamespace(data={}, config_entries=FakeConfigEntries([entry]))
+
+        connection = FakeConnection()
+        API.websocket_get_port_clients(
+            hass, connection, {"id": 11, "device_mac": device_mac}
+        )
+        self.assertEqual(connection.result[1]["etherlighting"]["brightness"], 60)
+
+        request_module = types.ModuleType("aiounifi.models.api")
+
+        class ApiRequest:
+            def __init__(self, method, path, data=None):
+                self.method = method
+                self.path = path
+                self.data = data
+
+        request_module.ApiRequest = ApiRequest
+        aiounifi = types.ModuleType("aiounifi")
+        models = types.ModuleType("aiounifi.models")
+        old_modules = {
+            key: sys.modules.get(key)
+            for key in ("aiounifi", "aiounifi.models", "aiounifi.models.api")
+        }
+        sys.modules["aiounifi"] = aiounifi
+        sys.modules["aiounifi.models"] = models
+        sys.modules["aiounifi.models.api"] = request_module
+        try:
+            import asyncio
+
+            connection = FakeConnection()
+            asyncio.run(
+                API.websocket_set_etherlighting(
+                    hass,
+                    connection,
+                    {
+                        "id": 12,
+                        "device_mac": device_mac,
+                        "led_mode": "etherlighting",
+                        "brightness": 80,
+                    },
+                )
+            )
+        finally:
+            for key, value in old_modules.items():
+                if value is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = value
+
+        self.assertIsNone(connection.error)
+        self.assertEqual(connection.result[1]["etherlighting"]["led_mode"], "etherlighting")
+        self.assertEqual(api.requests[0].method, "put")
+        self.assertEqual(api.requests[0].path, "/rest/device/device-id-1")
+        self.assertEqual(api.requests[0].data["ether_lighting"]["future_field"], "preserved")
+        self.assertEqual(api.requests[1].method, "get")
+        self.assertEqual(api.requests[1].path, "/stat/device")
 
 
 if __name__ == "__main__":

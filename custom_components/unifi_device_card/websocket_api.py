@@ -1,8 +1,10 @@
-"""Read-only WebSocket API for UniFi Device Card."""
+"""WebSocket API for UniFi Device Card topology and optional controls."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from datetime import timedelta
 import time
 from typing import Any
@@ -12,7 +14,13 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
-from .const import UNIFI_DOMAIN, WS_TYPE_PORT_CLIENTS
+from .const import (
+    DATA_ETHERLIGHTING_LOCKS,
+    DOMAIN,
+    UNIFI_DOMAIN,
+    WS_TYPE_PORT_CLIENTS,
+    WS_TYPE_SET_ETHERLIGHTING,
+)
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -53,6 +61,18 @@ def _normalize_mac(value: Any) -> str:
     if len(compact) != 12:
         return ""
     return ":".join(compact[index : index + 2] for index in range(0, 12, 2)).lower()
+
+
+def _find_device(api: Any, target_mac: str) -> Any | None:
+    """Find one loaded device by normalized MAC address."""
+    return next(
+        (
+            candidate
+            for candidate in _items(getattr(api, "devices", None))
+            if _normalize_mac(_value(candidate, "mac", "")) == target_mac
+        ),
+        None,
+    )
 
 
 def _positive_int(value: Any) -> int | None:
@@ -175,14 +195,7 @@ def _port_vlan(
 
 def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Return port state and mesh uplink data for one selected UniFi device."""
-    device = next(
-        (
-            candidate
-            for candidate in _items(getattr(api, "devices", None))
-            if _normalize_mac(_value(candidate, "mac", "")) == target_mac
-        ),
-        None,
-    )
+    device = _find_device(api, target_mac)
     if device is None:
         return None, []
 
@@ -245,7 +258,7 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
             signal = parsed
             break
 
-    is_mesh = uplink_type in {"wireless", "wireless uplink", "mesh"} or bool(uplink_ap_mac)
+    is_mesh = uplink_type in {"wireless", "wireless uplink", "mesh"}
     mesh = {
         "is_mesh": is_mesh,
         "signal_dbm": signal if is_mesh else None,
@@ -260,6 +273,139 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
     }
 
     return mesh, ports
+
+
+_ETHERLIGHTING_MODES = {"speed", "network"}
+_ETHERLIGHTING_BEHAVIORS = {"steady", "breath"}
+_ETHERLIGHTING_LED_MODES = {"standard", "etherlighting"}
+
+
+def _bounded_int(value: Any, minimum: int, maximum: int) -> int | None:
+    """Return an integer in the inclusive range, otherwise None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if minimum <= number <= maximum else None
+
+
+def _etherlighting_mapping(device: Any) -> tuple[str, dict[str, Any]] | None:
+    """Return the canonical Etherlighting mapping for a supported switch."""
+    raw = _raw(device)
+    device_type = str(_value(device, "type", "") or "").strip().lower()
+    if device_type and device_type != "usw":
+        return None
+
+    value = raw.get("ether_lighting")
+    if isinstance(value, Mapping):
+        return "ether_lighting", dict(value)
+    return None
+
+
+def _etherlighting_payload(device: Any) -> dict[str, Any] | None:
+    """Expose a small, safe Etherlighting view without raw device data."""
+    mapping = _etherlighting_mapping(device)
+    if mapping is None:
+        return None
+
+    payload = _etherlighting_payload_from_mapping(mapping[1])
+    return payload if payload["supported"] else None
+
+
+def _etherlighting_payload_from_mapping(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize an Etherlighting mapping for a WebSocket response."""
+    led_mode = str(source.get("led_mode") or "").strip().lower()
+    mode = str(source.get("mode") or "").strip().lower()
+    behavior = str(source.get("behavior") or "").strip().lower()
+    brightness = _bounded_int(source.get("brightness"), 1, 100)
+    supported = (
+        led_mode in _ETHERLIGHTING_LED_MODES
+        and mode in _ETHERLIGHTING_MODES
+        and behavior in _ETHERLIGHTING_BEHAVIORS
+        and brightness is not None
+    )
+    return {
+        "supported": supported,
+        "led_mode": led_mode if led_mode in _ETHERLIGHTING_LED_MODES else None,
+        "mode": mode if mode in _ETHERLIGHTING_MODES else None,
+        "behavior": behavior if behavior in _ETHERLIGHTING_BEHAVIORS else None,
+        "brightness": brightness,
+    }
+
+
+def _etherlighting_patch(msg: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Validate the narrow set of Etherlighting controls exposed to the card."""
+    patch: dict[str, Any] = {}
+    for key, allowed in (
+        ("led_mode", _ETHERLIGHTING_LED_MODES),
+        ("mode", _ETHERLIGHTING_MODES),
+        ("behavior", _ETHERLIGHTING_BEHAVIORS),
+    ):
+        if key not in msg:
+            continue
+        value = str(msg.get(key) or "").strip().lower()
+        if value not in allowed:
+            return None
+        patch[key] = value
+
+    if "brightness" in msg:
+        brightness = msg.get("brightness")
+        if type(brightness) is not int or not 1 <= brightness <= 100:
+            return None
+        patch["brightness"] = brightness
+
+    return patch or None
+
+
+def _device_id(device: Any) -> str:
+    """Read the controller object id used by the REST device endpoint."""
+    value = _value(device, "id", "")
+    if value:
+        return str(value).strip()
+    raw = _raw(device)
+    return str(raw.get("device_id") or raw.get("_id") or raw.get("id") or "").strip()
+
+
+def _is_user_admin(connection: Any) -> bool:
+    """Require an authenticated Home Assistant administrator for writes."""
+    user = getattr(connection, "user", None)
+    return bool(getattr(user, "is_admin", False))
+
+
+def _is_unifi_admin(hub: Any) -> bool:
+    """Honor the official UniFi integration's role flag when available."""
+    return getattr(hub, "is_admin", False) is True
+
+
+def _verified_etherlighting_mapping(
+    response: Any, target_mac: str
+) -> Mapping[str, Any] | None:
+    """Read the selected device's canonical Etherlighting data from a REST result."""
+    if not isinstance(response, Mapping):
+        return None
+    records = response.get("data")
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if _normalize_mac(record.get("mac")) != target_mac:
+            continue
+        value = record.get("ether_lighting")
+        return value if isinstance(value, Mapping) else None
+    return None
+
+
+def _etherlighting_patch_matches(
+    source: Mapping[str, Any], patch: Mapping[str, Any]
+) -> bool:
+    """Confirm the controller returned every requested normalized value."""
+    normalized = _etherlighting_payload_from_mapping(source)
+    return normalized["supported"] and all(normalized.get(key) == value for key, value in patch.items())
 
 
 def _client_payload(client: Any) -> dict[str, Any]:
@@ -324,6 +470,7 @@ def websocket_get_port_clients(
     ports_by_number: dict[int, dict[str, Any]] = {}
     sources: list[dict[str, Any]] = []
     mesh: dict[str, Any] | None = None
+    etherlighting: dict[str, Any] | None = None
     matched_device = False
 
     for entry in hass.config_entries.async_loaded_entries(UNIFI_DOMAIN):
@@ -339,6 +486,10 @@ def websocket_get_port_clients(
             mesh = source_mesh
             for port in source_ports:
                 ports_by_number[port["port"]] = port
+
+            if etherlighting is None:
+                device = _find_device(api, target_mac)
+                etherlighting = _etherlighting_payload(device) if device is not None else None
 
         for client in _items(getattr(api, "clients", None)):
             if not _client_is_current(client, hub):
@@ -374,6 +525,152 @@ def websocket_get_port_clients(
             "ports": ports,
             "clients": clients,
             "mesh": mesh,
+            "etherlighting": etherlighting,
             "updated_at": int(time.time()),
         },
     )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_SET_ETHERLIGHTING,
+        vol.Required("device_mac"): str,
+        vol.Optional("led_mode"): str,
+        vol.Optional("mode"): str,
+        vol.Optional("behavior"): str,
+        vol.Optional("brightness"): object,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_set_etherlighting(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Apply a narrowly validated Etherlighting change through UniFi's API."""
+    if not _is_user_admin(connection):
+        connection.send_error(msg["id"], "not_authorized", "Home Assistant administrator required")
+        return
+
+    target_mac = _normalize_mac(msg.get("device_mac"))
+    if not target_mac:
+        connection.send_error(msg["id"], "invalid_device_mac", "Invalid device MAC address")
+        return
+
+    patch = _etherlighting_patch(msg)
+    if patch is None:
+        connection.send_error(msg["id"], "invalid_etherlighting", "Invalid Etherlighting values")
+        return
+
+    for entry in hass.config_entries.async_loaded_entries(UNIFI_DOMAIN):
+        hub = getattr(entry, "runtime_data", None)
+        api = getattr(hub, "api", None)
+        if api is None:
+            continue
+
+        device = _find_device(api, target_mac)
+        if device is None:
+            continue
+        if not _is_unifi_admin(hub):
+            connection.send_error(
+                msg["id"],
+                "unifi_admin_required",
+                "The UniFi Network integration account must be an administrator",
+            )
+            return
+
+        mapping = _etherlighting_mapping(device)
+        device_id = _device_id(device)
+        request_method = getattr(api, "request", None)
+        if mapping is None or not device_id or not callable(request_method):
+            connection.send_error(
+                msg["id"],
+                "etherlighting_unsupported",
+                "This device or UniFi runtime does not expose Etherlighting controls",
+            )
+            return
+
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        locks = domain_data.setdefault(DATA_ETHERLIGHTING_LOCKS, {})
+        lock_key = f"{entry.entry_id}:{device_id}"
+        lock = locks.setdefault(lock_key, asyncio.Lock())
+
+        async with lock:
+            # Re-read the live object after waiting so two cards cannot merge
+            # their changes from the same stale snapshot.
+            device = _find_device(api, target_mac)
+            mapping = _etherlighting_mapping(device) if device is not None else None
+            if mapping is None:
+                connection.send_error(
+                    msg["id"],
+                    "etherlighting_unsupported",
+                    "The canonical Etherlighting device payload is no longer available",
+                )
+                return
+
+            _, current = mapping
+            merged = deepcopy(current)
+            merged.update(patch)
+
+            try:
+                # ApiRequest is intentionally imported lazily: the companion
+                # consumes the aiounifi runtime already owned by Home Assistant.
+                from aiounifi.models.api import ApiRequest
+
+                path = f"/rest/device/{device_id}"
+                request = ApiRequest(
+                    method="put",
+                    path=path,
+                    data={"ether_lighting": merged},
+                )
+                await request_method(request)
+
+                verified = None
+                for attempt in range(3):
+                    if attempt:
+                        await asyncio.sleep(0.35)
+                    verify_response = await request_method(
+                        ApiRequest(method="get", path="/stat/device")
+                    )
+                    candidate = _verified_etherlighting_mapping(verify_response, target_mac)
+                    if candidate is not None and _etherlighting_patch_matches(candidate, patch):
+                        verified = candidate
+                        break
+            except ImportError:
+                connection.send_error(
+                    msg["id"], "unsupported_runtime", "UniFi request runtime unavailable"
+                )
+                return
+            except (AttributeError, TypeError, ValueError) as err:
+                connection.send_error(msg["id"], "etherlighting_failed", str(err)[:160])
+                return
+            except Exception:
+                # Do not expose controller responses or credentials to the browser.
+                connection.send_error(
+                    msg["id"],
+                    "etherlighting_failed",
+                    "UniFi rejected the Etherlighting change",
+                )
+                return
+
+            if verified is None:
+                connection.send_error(
+                    msg["id"],
+                    "etherlighting_unverified",
+                    "UniFi did not confirm the Etherlighting change",
+                )
+                return
+
+        result = _etherlighting_payload_from_mapping(verified)
+        connection.send_result(
+            msg["id"],
+            {
+                "available": True,
+                "device_mac": target_mac,
+                "etherlighting": result,
+            },
+        )
+        return
+
+    connection.send_error(msg["id"], "device_not_found", "UniFi device is not loaded")

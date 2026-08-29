@@ -4,9 +4,9 @@ Optional Home Assistant companion integration for
 [UniFi Device Card](https://github.com/RAFd3v-HA/HACS-Unifi-Card).
 
 It reuses the already configured official **UniFi Network** integration and
-exposes its current, in-memory topology to the card through a read-only Home
-Assistant WebSocket command. No additional UniFi credentials, API key, direct
-browser access, sensor attributes, or second controller session are used.
+exposes its current, in-memory topology to the card through Home Assistant
+WebSocket commands. No additional UniFi credentials, API key, direct browser
+access, sensor attributes, or second controller session are used.
 
 ## What it adds
 
@@ -15,6 +15,8 @@ browser access, sensor attributes, or second controller session are used.
 - reliable port link state, link speed and configured port name
 - wireless client association and 2.4/5/6 GHz band data
 - wireless mesh uplink name, MAC address and signal when UniFi reports one
+- native LED toggle for devices that expose an official Home Assistant light entity
+- Etherlighting mode, pattern and brightness controls when the UniFi device reports the native capability
 
 The card remains usable without this integration and falls back to regular
 Home Assistant entities.
@@ -34,9 +36,16 @@ correct controller by the device MAC requested by the card.
 
 ## Privacy and scope
 
-The WebSocket command is available only to authenticated Home Assistant users.
-It is read-only and only returns the selected UniFi device, its ports, and the
-clients directly associated with that device.
+The topology WebSocket command is available only to authenticated Home
+Assistant users and only returns the selected UniFi device, its ports, and the
+clients directly associated with that device. Etherlighting writes are limited
+to Home Assistant administrators whose existing UniFi account is also an
+administrator. The backend requires the canonical capability reported by the
+official UniFi runtime, preserves all unknown controller fields, validates the
+mode, behavior and brightness values, serializes writes per device, and verifies
+every change with a controller read-back before reporting success. Requests use
+the already authenticated controller session. SSH, `/proc/led/*`, and `ubus` are
+never used.
 
 ## Compatibility
 

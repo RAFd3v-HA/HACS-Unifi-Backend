@@ -29,3 +29,10 @@ die bereits geladene Verbindung der offiziellen UniFi-Network-Integration.
 
 Wenn das Backend fehlt oder vorübergehend nicht verfügbar ist, verwendet die
 Karte weiterhin automatisch ihre bisherige Entity-basierte Erkennung.
+
+Die LED-Schaltfläche erscheint für Switches und Access Points, sobald die
+offizielle UniFi-Integration eine `light.*`-Entity für das Gerät bereitstellt.
+Etherlighting wird nur bei Geräten angezeigt, die der UniFi-Controller als
+fähig meldet. Änderungen an Etherlighting sind auf Home-Assistant- und UniFi-
+Administratoren beschränkt; auf nicht unterstützten Geräten bleibt die Karte
+unverändert.
