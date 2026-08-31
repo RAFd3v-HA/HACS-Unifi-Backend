@@ -22,16 +22,34 @@ eigentliche Karte bleibt ein separates **Dashboard**-Repository.
 7. Home Assistant neu starten.
 8. **Einstellungen → Geräte & Dienste → Integration hinzufügen** öffnen und
    **UniFi Device Card Backend** einmal hinzufügen.
-9. Die Dashboard-Seite neu laden.
+9. Die vorhandene offizielle UniFi-Integration als Datenquelle auswählen
+   (empfohlen).
+10. Die Dashboard-Seite neu laden.
 
-Es werden keine zusätzlichen UniFi-Zugangsdaten abgefragt. Das Backend nutzt
-die bereits geladene Verbindung der offiziellen UniFi-Network-Integration.
+Im empfohlenen Standardmodus werden keine zusätzlichen UniFi-Zugangsdaten
+abgefragt. Das Backend nutzt die geladenen Verbindungen der offiziellen
+UniFi-Network-Integration und erzeugt keine zweite Controller-Sitzung.
+
+Nur wenn diese Quelle die benötigten Daten nicht bereitstellt, kann bewusst
+**Separater UniFi-Login** als Fallback gewählt werden. Der Login und der
+gewählte Standort werden gegen den echten Controller geprüft. Zugangsdaten
+bleiben ausschließlich im Home-Assistant-Config-Entry und werden niemals an
+Karte oder Browser weitergegeben. Für Schreibaktionen wie PoE-Neustart oder
+Etherlighting benötigt das UniFi-Konto Administratorrechte.
+
+**Konfigurieren** zeigt Quellenstatus und Diagnoseeinstellung. **Neu
+konfigurieren** wechselt die Quelle oder erneuert separate Zugangsdaten. Das
+Backend legt keine Dashboard-Karten an und verändert vorhandene
+Lovelace-Konfigurationen nicht automatisch.
 
 Wenn das Backend fehlt oder vorübergehend nicht verfügbar ist, verwendet die
 Karte weiterhin automatisch ihre bisherige Entity-basierte Erkennung.
 
 Die LED-Schaltfläche erscheint für Switches und Access Points, sobald die
 offizielle UniFi-Integration eine `light.*`-Entity für das Gerät bereitstellt.
+Ein PoE-Neustart wird zusätzlich über das Backend angeboten, wenn der Controller
+den gewählten Port eindeutig als PoE-fähig und aktiviert meldet; dafür sind
+Administratorrechte in Home Assistant und UniFi erforderlich.
 Etherlighting wird nur bei Geräten angezeigt, die der UniFi-Controller als
 fähig meldet. Änderungen an Etherlighting sind auf Home-Assistant- und UniFi-
 Administratoren beschränkt; auf nicht unterstützten Geräten bleibt die Karte

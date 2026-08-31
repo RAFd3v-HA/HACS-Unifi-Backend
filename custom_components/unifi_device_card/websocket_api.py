@@ -12,15 +12,25 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_CONNECTION_MODE,
+    CONF_UNIFI_ENTRY_ID,
+    CONNECTION_MODE_DIRECT,
     DATA_ETHERLIGHTING_LOCKS,
+    DATA_POWER_CYCLE_LOCKS,
+    DEFAULT_CONNECTION_MODE,
     DOMAIN,
     UNIFI_DOMAIN,
+    UNIFI_ENTRY_AUTO,
     WS_TYPE_PORT_CLIENTS,
+    WS_TYPE_POWER_CYCLE_POE,
     WS_TYPE_SET_ETHERLIGHTING,
 )
+from .runtime import DirectRuntime
+
+_POWER_CYCLE_TIMEOUT_SECONDS = 15.0
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -55,6 +65,17 @@ def _items(handler: Any) -> Iterable[Any]:
         return ()
 
 
+def _keyed_items(handler: Any) -> Iterable[tuple[Any, Any]]:
+    """Return key/value pairs from an aiounifi handler using duck typing."""
+    items = getattr(handler, "items", None)
+    if not callable(items):
+        return ()
+    try:
+        return tuple(items())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return ()
+
+
 def _normalize_mac(value: Any) -> str:
     """Normalize a MAC address to lower-case colon notation."""
     compact = "".join(char for char in str(value or "") if char.lower() in "0123456789abcdef")
@@ -84,6 +105,51 @@ def _positive_int(value: Any) -> int | None:
     return result if result > 0 else None
 
 
+def _requested_port(value: Any) -> int | None:
+    """Accept only a positive integer supplied by the WebSocket caller."""
+    return value if type(value) is int and value > 0 else None
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    """Return a finite, non-negative number or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if 0 <= result < float("inf") else None
+
+
+def _find_port(api: Any, target_mac: str, target_port: int) -> Any | None:
+    """Find one canonical aiounifi port belonging to the selected device."""
+    matches: list[Any] = []
+    for object_id, port in _keyed_items(getattr(api, "ports", None)):
+        parent_id, separator, index = str(object_id).rpartition("_")
+        if not separator or _normalize_mac(parent_id) != target_mac:
+            continue
+        if _positive_int(index) != target_port:
+            continue
+        if _positive_int(_value(port, "port_idx")) != target_port:
+            continue
+        matches.append(port)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _port_is_uplink(device: Any, port: Any, target_port: int) -> bool:
+    """Protect any port UniFi identifies as the device's uplink."""
+    port_raw = port if isinstance(port, Mapping) else _raw(port)
+    if port_raw.get("is_uplink") is True:
+        return True
+
+    device_raw = _raw(device)
+    for key in ("uplink", "last_uplink"):
+        value = device_raw.get(key)
+        if isinstance(value, Mapping) and _positive_int(value.get("port_idx")) == target_port:
+            return True
+    return False
+
+
 def _vlan(value: Any) -> int | str | None:
     """Return a compact JSON-safe VLAN identifier."""
     if value is None or isinstance(value, bool):
@@ -107,13 +173,24 @@ def _detection_seconds(hub: Any) -> float:
         return 300.0
 
 
+def _client_last_seen(client: Any) -> float:
+    """Return the newest controller observation for a client."""
+    raw = _raw(client)
+    candidates = (
+        _nonnegative_float(_value(client, "last_seen", raw.get("last_seen"))),
+        _nonnegative_float(
+            _value(client, "last_seen_by_switch", raw.get("_last_seen_by_usw"))
+        ),
+        _nonnegative_float(
+            _value(client, "last_seen_by_access_point", raw.get("_last_seen_by_uap"))
+        ),
+    )
+    return max((value for value in candidates if value), default=0.0)
+
+
 def _client_is_current(client: Any, hub: Any) -> bool:
     """Reject stale records while retaining active records without timestamps."""
-    last_seen = _value(client, "last_seen", 0)
-    try:
-        timestamp = float(last_seen)
-    except (TypeError, ValueError):
-        return True
+    timestamp = _client_last_seen(client)
     if timestamp <= 0:
         return True
     return time.time() - timestamp <= _detection_seconds(hub)
@@ -218,6 +295,18 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
             continue
         merged = {**raw_port, **overrides.get(port_idx, {})}
         vlan, vlan_source = _port_vlan(merged, network_index)
+        poe_capable = (
+            merged.get("port_poe")
+            if isinstance(merged.get("port_poe"), bool)
+            else None
+        )
+        poe_enabled = (
+            merged.get("poe_enable")
+            if isinstance(merged.get("poe_enable"), bool)
+            else None
+        )
+        poe_mode = str(merged.get("poe_mode") or "").strip().lower()[:32] or None
+        is_uplink = _port_is_uplink(device, merged, port_idx)
         ports.append(
             {
                 "port": port_idx,
@@ -227,10 +316,21 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
                     merged.get("enable") if isinstance(merged.get("enable"), bool) else None
                 ),
                 "speed_mbps": _positive_int(merged.get("speed")),
-                "is_uplink": bool(merged.get("is_uplink", False)),
+                "is_uplink": is_uplink,
                 "native_vlan": vlan,
                 "vlan_source": vlan_source or None,
                 "port_profile_id": str(merged.get("portconf_id") or "") or None,
+                "poe_capable": poe_capable,
+                "poe_enabled": poe_enabled,
+                "poe_mode": poe_mode,
+                "poe_power_w": _nonnegative_float(merged.get("poe_power")),
+                "power_cycle_available": bool(
+                    poe_capable is True
+                    and poe_enabled is True
+                    and poe_mode != "off"
+                    and not is_uplink
+                    and raw.get("disabled") is not True
+                ),
             }
         )
 
@@ -381,6 +481,23 @@ def _is_unifi_admin(hub: Any) -> bool:
     return getattr(hub, "is_admin", False) is True
 
 
+def _power_cycle_target_error(
+    device: Any, port: Any, target_port: int
+) -> tuple[str, str] | None:
+    """Return a safe error for a port that must not be power cycled."""
+    if _value(device, "disabled", False) is True:
+        return "device_unavailable", "The UniFi device is disabled"
+    if _port_is_uplink(device, port, target_port):
+        return "uplink_protected", "Power cycling an uplink port is not allowed"
+    if _value(port, "port_poe") is not True:
+        return "poe_unsupported", "This port does not report PoE capability"
+    if _value(port, "poe_enable") is not True:
+        return "poe_disabled", "PoE is not currently active on this port"
+    if str(_value(port, "poe_mode", "") or "").strip().lower() == "off":
+        return "poe_disabled", "PoE is disabled on this port"
+    return None
+
+
 def _verified_etherlighting_mapping(
     response: Any, target_mac: str
 ) -> Mapping[str, Any] | None:
@@ -411,7 +528,14 @@ def _etherlighting_patch_matches(
 def _client_payload(client: Any) -> dict[str, Any]:
     """Serialize only the fields the frontend needs."""
     raw = _raw(client)
-    is_wired = bool(_value(client, "is_wired", False))
+    switch_mac = _normalize_mac(_value(client, "switch_mac", raw.get("sw_mac")))
+    switch_port = _positive_int(_value(client, "switch_port", raw.get("sw_port")))
+    access_point_mac = _normalize_mac(
+        _value(client, "access_point_mac", raw.get("ap_mac"))
+    )
+    direct = bool(switch_mac and switch_port is not None and not access_point_mac)
+    reported_wired = _value(client, "is_wired", None)
+    is_wired = bool(reported_wired is True or reported_wired == 1 or direct)
     return {
         "name": _client_name(client),
         "hostname": str(_value(client, "hostname", "") or "")[:128] or None,
@@ -421,31 +545,248 @@ def _client_payload(client: Any) -> dict[str, Any]:
         "network": str(raw.get("network") or "")[:128] or None,
         "network_id": str(raw.get("network_id") or "")[:128] or None,
         "is_wired": is_wired,
-        "switch_mac": _normalize_mac(_value(client, "switch_mac", raw.get("sw_mac"))) or None,
-        "switch_port": _positive_int(_value(client, "switch_port", raw.get("sw_port"))),
-        "access_point_mac": _normalize_mac(
-            _value(client, "access_point_mac", raw.get("ap_mac"))
-        )
-        or None,
+        "switch_mac": switch_mac or None,
+        "switch_port": switch_port,
+        "access_point_mac": access_point_mac or None,
         "band": _wifi_band(client),
         "rate_mbps": _positive_int(
             _value(client, "wired_rate_mbps", raw.get("wired_rate_mbps"))
         ),
-        "last_seen": _positive_int(_value(client, "last_seen", 0)),
+        "last_seen": _positive_int(_client_last_seen(client)),
         "source": "client",
-        "direct": True,
+        "direct": direct,
     }
 
 
-def _source_payload(entry: Any, hub: Any, available: bool, error: str | None = None) -> dict[str, Any]:
-    """Describe one official UniFi source without exposing credentials."""
+def _device_last_seen(device: Any) -> float:
+    """Return a device heartbeat timestamp without requiring a concrete model class."""
+    return _nonnegative_float(_value(device, "last_seen", _raw(device).get("last_seen"))) or 0.0
+
+
+def _infrastructure_client_payload(
+    device: Any,
+    target_mac: str,
+    hub: Any,
+    ports_by_number: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Map a live managed UniFi device to its parent switch port."""
+    raw = _raw(device)
+    device_mac = _normalize_mac(_value(device, "mac", ""))
+    if not device_mac or device_mac == target_mac:
+        return None
+
+    try:
+        connected = int(_value(device, "state", raw.get("state", -1))) == 1
+    except (TypeError, ValueError):
+        connected = False
+    if not connected:
+        return None
+
+    last_seen = _device_last_seen(device)
+    if last_seen > 0 and time.time() - last_seen > _detection_seconds(hub):
+        return None
+
+    selected_uplink: Mapping[str, Any] | None = None
+    selected_port: int | None = None
+    for key in ("uplink", "last_uplink"):
+        uplink = raw.get(key)
+        if not isinstance(uplink, Mapping):
+            continue
+        uplink_type = str(uplink.get("type") or "").strip().lower()
+        if uplink_type not in {"wire", "wired", "ethernet"}:
+            continue
+        if _normalize_mac(uplink.get("uplink_mac")) != target_mac:
+            continue
+        remote_port = _positive_int(uplink.get("uplink_remote_port"))
+        if remote_port is None:
+            continue
+        if key == "uplink" and uplink.get("up") is False:
+            continue
+        # A remembered last uplink is accepted only while the parent still
+        # reports that port up. This avoids resurrecting stale topology.
+        if key == "last_uplink" and ports_by_number.get(remote_port, {}).get("up") is not True:
+            continue
+        selected_uplink = uplink
+        selected_port = remote_port
+        break
+
+    if selected_uplink is None or selected_port is None:
+        return None
+
+    name = str(
+        _value(device, "name", "")
+        or _value(device, "model", "")
+        or device_mac
+    ).strip()[:128]
+    return {
+        "name": name or device_mac,
+        "hostname": None,
+        "mac": device_mac,
+        "ip": str(_value(device, "ip", "") or "")[:64] or None,
+        "vlan": _vlan(selected_uplink.get("vlan")),
+        "network": None,
+        "network_id": None,
+        "is_wired": True,
+        "switch_mac": target_mac,
+        "switch_port": selected_port,
+        "access_point_mac": None,
+        "band": None,
+        "rate_mbps": _positive_int(selected_uplink.get("speed")),
+        "last_seen": _positive_int(last_seen),
+        "source": "device",
+        "direct": True,
+        "confidence": "strong",
+    }
+
+
+def _is_unicast_mac(value: Any) -> bool:
+    """Return True for a normal, non-broadcast unicast MAC address."""
+    mac = _normalize_mac(value)
+    if not mac or mac == "00:00:00:00:00:00" or mac == "ff:ff:ff:ff:ff:ff":
+        return False
+    return int(mac[:2], 16) & 1 == 0
+
+
+def _mac_table_fallbacks(
+    api: Any,
+    target_mac: str,
+    ports_by_number: Mapping[int, Mapping[str, Any]],
+    existing_clients: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return only unambiguous edge-port MAC observations."""
+    device = _find_device(api, target_mac)
+    if device is None:
+        return []
+
+    assigned_macs = {
+        mac for mac in existing_clients if _normalize_mac(mac)
+    }
+    assigned_ports = {
+        _positive_int(payload.get("switch_port"))
+        for payload in existing_clients.values()
+        if payload.get("switch_mac") == target_mac and payload.get("direct") is True
+    }
+    known_clients = {
+        _normalize_mac(_value(client, "mac", "")): client
+        for client in _items(getattr(api, "clients_all", None))
+        if _normalize_mac(_value(client, "mac", ""))
+    }
+
+    results: list[dict[str, Any]] = []
+    for raw_port in _raw(device).get("port_table", ()):
+        if not isinstance(raw_port, Mapping):
+            continue
+        port_idx = _positive_int(raw_port.get("port_idx"))
+        port_state = ports_by_number.get(port_idx or -1, {})
+        if (
+            port_idx is None
+            or port_state.get("up") is not True
+            or port_idx in assigned_ports
+            or _port_is_uplink(device, raw_port, port_idx)
+        ):
+            continue
+
+        candidates: dict[str, Mapping[str, Any]] = {}
+        table = raw_port.get("mac_table")
+        if not isinstance(table, list):
+            continue
+        for item in table:
+            if not isinstance(item, Mapping) or not _is_unicast_mac(item.get("mac")):
+                continue
+            mac = _normalize_mac(item.get("mac"))
+            if mac == target_mac or mac in assigned_macs:
+                continue
+            candidates[mac] = item
+        if len(candidates) != 1:
+            continue
+
+        mac, observation = next(iter(candidates.items()))
+        known = known_clients.get(mac)
+        payload = _client_payload(known) if known is not None else {
+            "name": mac,
+            "hostname": None,
+            "mac": mac,
+            "ip": None,
+            "vlan": None,
+            "network": None,
+            "network_id": None,
+            "band": None,
+            "rate_mbps": None,
+            "last_seen": None,
+        }
+        payload.update(
+            {
+                "name": payload.get("name") or mac,
+                "mac": mac,
+                "vlan": _vlan(observation.get("vlan")) or payload.get("vlan"),
+                "is_wired": True,
+                "switch_mac": target_mac,
+                "switch_port": port_idx,
+                "access_point_mac": None,
+                "source": "mac_table",
+                "direct": True,
+                "confidence": "fallback",
+            }
+        )
+        results.append(payload)
+        assigned_macs.add(mac)
+        assigned_ports.add(port_idx)
+
+    return results
+
+
+def _source_payload(
+    entry: Any,
+    hub: Any,
+    available: bool,
+    error: str | None = None,
+    source_type: str = "official",
+) -> dict[str, Any]:
+    """Describe one UniFi source without exposing credentials."""
     return {
         "config_entry_id": entry.entry_id,
         "title": entry.title,
         "site": str(getattr(hub, "site", "") or "") or None,
+        "source_type": source_type,
         "available": available,
         "error": error,
     }
+
+
+async def _async_unifi_sources(
+    hass: HomeAssistant, *, refresh_direct: bool = False
+) -> list[tuple[Any, Any, str]]:
+    """Resolve exactly the configured UniFi source mode."""
+    entries_method = getattr(hass.config_entries, "async_entries", None)
+    companion_entries = (
+        entries_method(DOMAIN)
+        if callable(entries_method)
+        else hass.config_entries.async_loaded_entries(DOMAIN)
+    )
+    companion_entry = companion_entries[0] if companion_entries else None
+    companion_data = getattr(companion_entry, "data", {}) if companion_entry else {}
+    mode = companion_data.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+
+    if mode == CONNECTION_MODE_DIRECT:
+        runtime = getattr(companion_entry, "runtime_data", None)
+        if not isinstance(runtime, DirectRuntime):
+            # Preserve the explicitly selected direct source in status output.
+            # Never fall back silently to an official runtime in this mode.
+            return [(companion_entry, None, "direct")]
+        if refresh_direct:
+            await runtime.async_refresh()
+        return [(companion_entry, runtime, "direct")]
+
+    official_entries = hass.config_entries.async_loaded_entries(UNIFI_DOMAIN)
+    selected_entry_id = companion_data.get(CONF_UNIFI_ENTRY_ID, UNIFI_ENTRY_AUTO)
+    if selected_entry_id and selected_entry_id != UNIFI_ENTRY_AUTO:
+        official_entries = [
+            entry for entry in official_entries if entry.entry_id == selected_entry_id
+        ]
+    return [
+        (entry, getattr(entry, "runtime_data", None), "official")
+        for entry in official_entries
+    ]
 
 
 @websocket_api.websocket_command(
@@ -454,8 +795,8 @@ def _source_payload(entry: Any, hub: Any, available: bool, error: str | None = N
         vol.Required("device_mac"): str,
     }
 )
-@callback
-def websocket_get_port_clients(
+@websocket_api.async_response
+async def websocket_get_port_clients(
     hass: HomeAssistant,
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
@@ -473,18 +814,31 @@ def websocket_get_port_clients(
     etherlighting: dict[str, Any] | None = None
     matched_device = False
 
-    for entry in hass.config_entries.async_loaded_entries(UNIFI_DOMAIN):
-        hub = getattr(entry, "runtime_data", None)
+    for entry, hub, source_type in await _async_unifi_sources(
+        hass, refresh_direct=True
+    ):
         api = getattr(hub, "api", None)
         if api is None:
-            sources.append(_source_payload(entry, hub, False, "unsupported_runtime"))
+            sources.append(
+                _source_payload(
+                    entry, hub, False, "unsupported_runtime", source_type
+                )
+            )
             continue
 
         source_mesh, source_ports = _device_payload(api, target_mac)
         if source_mesh is not None:
             matched_device = True
             mesh = source_mesh
+            power_cycle_allowed = bool(
+                _is_user_admin(connection)
+                and _is_unifi_admin(hub)
+                and getattr(hub, "available", False) is True
+            )
             for port in source_ports:
+                port["power_cycle_available"] = bool(
+                    port.get("power_cycle_available") and power_cycle_allowed
+                )
                 ports_by_number[port["port"]] = port
 
             if etherlighting is None:
@@ -503,8 +857,34 @@ def websocket_get_port_clients(
             key = payload["mac"] or f"{payload['name']}:{len(clients_by_mac)}"
             clients_by_mac[key] = payload
 
+        # Managed UniFi infrastructure is not part of /stat/sta. Its current
+        # wired uplink is nevertheless an authoritative parent-port mapping.
+        for device in _items(getattr(api, "devices", None)):
+            payload = _infrastructure_client_payload(
+                device, target_mac, hub, ports_by_number
+            )
+            if payload is None:
+                continue
+            key = payload["mac"] or f"{payload['name']}:{len(clients_by_mac)}"
+            clients_by_mac[key] = payload
+
+        # Some non-HA clients can briefly be absent from /stat/sta. Accept a
+        # port MAC-table observation only when it is an unambiguous active edge
+        # port, never on an uplink or a port with multiple learned MACs.
+        for payload in _mac_table_fallbacks(
+            api, target_mac, ports_by_number, clients_by_mac
+        ):
+            key = payload["mac"] or f"{payload['name']}:{len(clients_by_mac)}"
+            clients_by_mac.setdefault(key, payload)
+
         sources.append(
-            _source_payload(entry, hub, bool(getattr(hub, "available", True)))
+            _source_payload(
+                entry,
+                hub,
+                bool(getattr(hub, "available", True)),
+                getattr(hub, "last_error_code", None),
+                source_type,
+            )
         )
 
     clients = sorted(
@@ -519,7 +899,10 @@ def websocket_get_port_clients(
     connection.send_result(
         msg["id"],
         {
-            "available": matched_device,
+            "available": bool(matched_device or ports or clients),
+            "device_found": matched_device,
+            "ports_available": bool(ports),
+            "clients_available": bool(clients),
             "device_mac": target_mac,
             "sources": sources,
             "ports": ports,
@@ -529,6 +912,157 @@ def websocket_get_port_clients(
             "updated_at": int(time.time()),
         },
     )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_POWER_CYCLE_POE,
+        vol.Required("device_mac"): str,
+        vol.Required("port"): int,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_power_cycle_poe(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Power cycle one validated PoE port through the configured UniFi runtime."""
+    if not _is_user_admin(connection):
+        connection.send_error(msg["id"], "not_authorized", "Home Assistant administrator required")
+        return
+
+    target_mac = _normalize_mac(msg.get("device_mac"))
+    if not target_mac:
+        connection.send_error(msg["id"], "invalid_device_mac", "Invalid device MAC address")
+        return
+
+    target_port = _requested_port(msg.get("port"))
+    if target_port is None:
+        connection.send_error(msg["id"], "invalid_port", "Invalid port number")
+        return
+
+    matches: list[tuple[Any, Any, Any, Any]] = []
+    for entry, hub, _source_type in await _async_unifi_sources(
+        hass, refresh_direct=True
+    ):
+        api = getattr(hub, "api", None)
+        if api is None:
+            continue
+        device = _find_device(api, target_mac)
+        if device is not None:
+            matches.append((entry, hub, api, device))
+
+    if not matches:
+        connection.send_error(msg["id"], "device_not_found", "UniFi device is not loaded")
+        return
+    if len(matches) != 1:
+        connection.send_error(
+            msg["id"],
+            "ambiguous_device",
+            "The device is present in more than one UniFi runtime",
+        )
+        return
+
+    entry, hub, api, device = matches[0]
+    if not _is_unifi_admin(hub):
+        connection.send_error(
+            msg["id"],
+            "unifi_admin_required",
+            "The UniFi Network integration account must be an administrator",
+        )
+        return
+    if getattr(hub, "available", False) is not True:
+        connection.send_error(msg["id"], "device_unavailable", "UniFi is not connected")
+        return
+
+    request_method = getattr(api, "request", None)
+    ports_handler = getattr(api, "ports", None)
+    if not callable(request_method) or not callable(getattr(ports_handler, "items", None)):
+        connection.send_error(
+            msg["id"],
+            "unsupported_runtime",
+            "The UniFi runtime does not expose port controls",
+        )
+        return
+
+    port = _find_port(api, target_mac, target_port)
+    if port is None:
+        connection.send_error(msg["id"], "port_not_found", "UniFi port is not loaded")
+        return
+    if error := _power_cycle_target_error(device, port, target_port):
+        connection.send_error(msg["id"], *error)
+        return
+
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    locks = domain_data.setdefault(DATA_POWER_CYCLE_LOCKS, {})
+    lock_key = f"{entry.entry_id}:{target_mac}"
+    lock = locks.setdefault(lock_key, asyncio.Lock())
+    if lock.locked():
+        connection.send_error(
+            msg["id"], "power_cycle_busy", "A PoE power cycle is already in progress"
+        )
+        return
+
+    await lock.acquire()
+    try:
+        # Re-read all safety-relevant state after acquiring the device lock.
+        if not _is_unifi_admin(hub) or getattr(hub, "available", False) is not True:
+            connection.send_error(msg["id"], "device_unavailable", "UniFi is not connected")
+            return
+        device = _find_device(api, target_mac)
+        port = _find_port(api, target_mac, target_port)
+        if device is None or port is None:
+            connection.send_error(
+                msg["id"], "port_not_found", "The canonical UniFi port is no longer loaded"
+            )
+            return
+        if error := _power_cycle_target_error(device, port, target_port):
+            connection.send_error(msg["id"], *error)
+            return
+
+        try:
+            # This is the same aiounifi request model used by Home Assistant's
+            # official UniFi PoE power-cycle button.
+            from aiounifi.models.device import DevicePowerCyclePortRequest
+
+            request = DevicePowerCyclePortRequest.create(target_mac, target_port)
+            await asyncio.wait_for(
+                request_method(request), timeout=_POWER_CYCLE_TIMEOUT_SECONDS
+            )
+        except ImportError:
+            connection.send_error(
+                msg["id"], "unsupported_runtime", "UniFi power-cycle runtime unavailable"
+            )
+            return
+        except asyncio.TimeoutError:
+            # Never retry: the controller may have accepted the non-idempotent
+            # command even though its response did not arrive in time.
+            connection.send_error(
+                msg["id"],
+                "power_cycle_unconfirmed",
+                "UniFi did not confirm the PoE power-cycle request",
+            )
+            return
+        except Exception:
+            # Controller payloads and connection details must not reach the browser.
+            connection.send_error(
+                msg["id"], "power_cycle_failed", "UniFi rejected the PoE power cycle"
+            )
+            return
+
+        connection.send_result(
+            msg["id"],
+            {
+                "accepted": True,
+                "available": True,
+                "device_mac": target_mac,
+                "port": target_port,
+            },
+        )
+    finally:
+        lock.release()
 
 
 @websocket_api.websocket_command(
@@ -563,8 +1097,9 @@ async def websocket_set_etherlighting(
         connection.send_error(msg["id"], "invalid_etherlighting", "Invalid Etherlighting values")
         return
 
-    for entry in hass.config_entries.async_loaded_entries(UNIFI_DOMAIN):
-        hub = getattr(entry, "runtime_data", None)
+    for entry, hub, _source_type in await _async_unifi_sources(
+        hass, refresh_direct=True
+    ):
         api = getattr(hub, "api", None)
         if api is None:
             continue

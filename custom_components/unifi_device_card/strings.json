@@ -3,7 +3,93 @@
   "config": {
     "abort": {
       "already_configured": "The UniFi Device Card Backend is already configured.",
-      "unifi_not_configured": "Set up Home Assistant's official UniFi Network integration first."
+      "direct_validation_required": "Validate the direct controller connection before selecting a site.",
+      "reauth_not_direct": "This entry uses Home Assistant's official UniFi integration and has no separate credentials to reauthenticate.",
+      "reauth_successful": "The direct UniFi login was updated successfully.",
+      "reconfigure_successful": "The backend data source was updated successfully.",
+      "unifi_not_configured": "Set up Home Assistant's official UniFi Network integration first, or restart this setup and choose the separate login fallback."
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the UniFi Network controller.",
+      "invalid_auth": "The UniFi Network controller rejected the username or password.",
+      "invalid_site": "Select a site returned by the validated controller.",
+      "unknown": "An unexpected error occurred while validating the UniFi connection."
+    },
+    "step": {
+      "user": {
+        "title": "Choose the backend data source",
+        "description": "The existing Home Assistant UniFi integration is recommended and does not create another controller session. The separate login is an explicit fallback.",
+        "menu_options": {
+          "official": "Use the official UniFi integration (recommended)",
+          "direct": "Use a separate UniFi login"
+        },
+        "menu_option_descriptions": {
+          "official": "Reuse the live controller sessions and permissions already managed by Home Assistant.",
+          "direct": "Create a dedicated backend-only controller session. Choose this only when the official integration cannot provide the required data."
+        }
+      },
+      "reconfigure": {
+        "title": "Change the backend data source",
+        "description": "Changing the source reloads only this companion integration. It does not create, replace, or edit dashboard cards.",
+        "menu_options": {
+          "official": "Use the official UniFi integration (recommended)",
+          "direct": "Use a separate UniFi login"
+        },
+        "menu_option_descriptions": {
+          "official": "Stop using separate backend credentials and reuse Home Assistant's loaded UniFi sessions.",
+          "direct": "Validate and save a dedicated controller login for this backend only."
+        }
+      },
+      "official": {
+        "title": "Use Home Assistant's UniFi integration",
+        "description": "Found {controller_count} configured UniFi controller(s), of which {loaded_count} are currently loaded. The backend automatically matches a requested device to the correct loaded controller. No credentials are copied and no second session is created.",
+        "data": {
+          "diagnostics_enabled": "Include privacy-safe integration diagnostics"
+        },
+        "data_description": {
+          "diagnostics_enabled": "Diagnostics contain source status and object counts, but never controller credentials, client names, IP addresses, or MAC addresses."
+        }
+      },
+      "direct": {
+        "title": "Separate UniFi login fallback",
+        "description": "This creates a dedicated controller session only after you explicitly select this fallback. Credentials remain in Home Assistant's backend config entry and are never sent to the card. Use a local UniFi account; administrator rights are required only for write actions such as PoE cycling and Etherlighting.",
+        "data": {
+          "host": "Controller host",
+          "username": "Username",
+          "password": "Password",
+          "port": "Port",
+          "verify_ssl": "Verify TLS certificate",
+          "diagnostics_enabled": "Include privacy-safe integration diagnostics"
+        },
+        "data_description": {
+          "host": "Local IP address or hostname of the UniFi console or Network application.",
+          "username": "A local UniFi account is recommended.",
+          "password": "Stored only in Home Assistant's config entry. It is redacted from diagnostics.",
+          "verify_ssl": "Enable this only when the controller certificate is trusted by Home Assistant.",
+          "diagnostics_enabled": "Diagnostics contain status and counts, not credentials or network identities."
+        }
+      },
+      "site": {
+        "title": "Select the UniFi site",
+        "description": "Choose the site the card backend should read from through this dedicated login.",
+        "data": {
+          "site_identifier": "Site"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Backend status and diagnostics",
+        "description": "Current source: `{source}`. Home Assistant has {controller_count} configured official UniFi controller(s), of which {loaded_count} are loaded. To change the source or direct-login credentials, use **Reconfigure** on the integration. Dashboard cards are never modified automatically.",
+        "data": {
+          "diagnostics_enabled": "Include privacy-safe integration diagnostics"
+        },
+        "data_description": {
+          "diagnostics_enabled": "When disabled, downloaded diagnostics contain only this setting, the selected source, and entry state."
+        }
+      }
     }
   }
 }

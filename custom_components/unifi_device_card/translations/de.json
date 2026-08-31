@@ -3,7 +3,93 @@
   "config": {
     "abort": {
       "already_configured": "Das UniFi Device Card Backend ist bereits eingerichtet.",
-      "unifi_not_configured": "Richte zuerst die offizielle UniFi-Network-Integration von Home Assistant ein."
+      "direct_validation_required": "Prüfe zuerst die direkte Controller-Verbindung, bevor du einen Standort auswählst.",
+      "reauth_not_direct": "Dieser Eintrag nutzt die offizielle UniFi-Integration von Home Assistant und besitzt keine separaten Zugangsdaten zur erneuten Anmeldung.",
+      "reauth_successful": "Der separate UniFi-Login wurde erfolgreich aktualisiert.",
+      "reconfigure_successful": "Die Datenquelle des Backends wurde erfolgreich aktualisiert.",
+      "unifi_not_configured": "Richte zuerst die offizielle UniFi-Network-Integration von Home Assistant ein oder starte diese Einrichtung erneut und wähle den separaten Login als Fallback."
+    },
+    "error": {
+      "cannot_connect": "Die Verbindung zum UniFi-Network-Controller ist fehlgeschlagen.",
+      "invalid_auth": "Der UniFi-Network-Controller hat Benutzername oder Passwort abgelehnt.",
+      "invalid_site": "Wähle einen Standort, den der geprüfte Controller zurückgegeben hat.",
+      "unknown": "Beim Prüfen der UniFi-Verbindung ist ein unerwarteter Fehler aufgetreten."
+    },
+    "step": {
+      "user": {
+        "title": "Datenquelle des Backends wählen",
+        "description": "Die vorhandene offizielle UniFi-Integration von Home Assistant wird empfohlen und erzeugt keine weitere Controller-Sitzung. Der separate Login ist ein ausdrücklich gewählter Fallback.",
+        "menu_options": {
+          "official": "Offizielle UniFi-Integration verwenden (empfohlen)",
+          "direct": "Separaten UniFi-Login verwenden"
+        },
+        "menu_option_descriptions": {
+          "official": "Die von Home Assistant bereits verwalteten Controller-Sitzungen und Berechtigungen wiederverwenden.",
+          "direct": "Eine eigene Controller-Sitzung nur für das Backend erzeugen. Nur wählen, wenn die offizielle Integration die benötigten Daten nicht liefert."
+        }
+      },
+      "reconfigure": {
+        "title": "Datenquelle des Backends ändern",
+        "description": "Der Wechsel lädt nur diese Begleitintegration neu. Dashboard-Karten werden weder erstellt noch ersetzt oder verändert.",
+        "menu_options": {
+          "official": "Offizielle UniFi-Integration verwenden (empfohlen)",
+          "direct": "Separaten UniFi-Login verwenden"
+        },
+        "menu_option_descriptions": {
+          "official": "Separate Backend-Zugangsdaten nicht mehr verwenden und die geladenen UniFi-Sitzungen von Home Assistant nutzen.",
+          "direct": "Einen eigenen Controller-Login ausschließlich für dieses Backend prüfen und speichern."
+        }
+      },
+      "official": {
+        "title": "UniFi-Integration von Home Assistant verwenden",
+        "description": "Es wurden {controller_count} konfigurierte UniFi-Controller gefunden; davon sind aktuell {loaded_count} geladen. Das Backend ordnet ein angefragtes Gerät automatisch dem passenden geladenen Controller zu. Zugangsdaten werden weder kopiert noch wird eine zweite Sitzung erzeugt.",
+        "data": {
+          "diagnostics_enabled": "Datenschutzfreundliche Integrationsdiagnose einschließen"
+        },
+        "data_description": {
+          "diagnostics_enabled": "Die Diagnose enthält den Status der Datenquelle und Anzahlen, jedoch niemals Controller-Zugangsdaten, Client-Namen, IP-Adressen oder MAC-Adressen."
+        }
+      },
+      "direct": {
+        "title": "Separater UniFi-Login als Fallback",
+        "description": "Eine eigene Controller-Sitzung wird nur erzeugt, nachdem du diesen Fallback ausdrücklich gewählt hast. Die Zugangsdaten bleiben im Config-Entry von Home Assistant und werden niemals an die Karte gesendet. Verwende möglichst ein lokales UniFi-Konto; Administratorrechte werden nur für Schreibaktionen wie PoE-Neustart und Etherlighting benötigt.",
+        "data": {
+          "host": "Controller-Host",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "port": "Port",
+          "verify_ssl": "TLS-Zertifikat prüfen",
+          "diagnostics_enabled": "Datenschutzfreundliche Integrationsdiagnose einschließen"
+        },
+        "data_description": {
+          "host": "Lokale IP-Adresse oder Hostname der UniFi-Konsole bzw. Network-Anwendung.",
+          "username": "Ein lokales UniFi-Konto wird empfohlen.",
+          "password": "Wird ausschließlich im Config-Entry von Home Assistant gespeichert und in Diagnosen ausgeblendet.",
+          "verify_ssl": "Nur aktivieren, wenn Home Assistant dem Zertifikat des Controllers vertraut.",
+          "diagnostics_enabled": "Die Diagnose enthält Status und Anzahlen, aber keine Zugangsdaten oder Netzwerkidentitäten."
+        }
+      },
+      "site": {
+        "title": "UniFi-Standort wählen",
+        "description": "Wähle den Standort, den das Karten-Backend über diesen separaten Login auslesen soll.",
+        "data": {
+          "site_identifier": "Standort"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Backend-Status und Diagnose",
+        "description": "Aktuelle Datenquelle: `{source}`. Home Assistant kennt {controller_count} konfigurierte offizielle UniFi-Controller; davon sind {loaded_count} geladen. Verwende **Neu konfigurieren**, um die Quelle oder separate Zugangsdaten zu ändern. Dashboard-Karten werden niemals automatisch verändert.",
+        "data": {
+          "diagnostics_enabled": "Datenschutzfreundliche Integrationsdiagnose einschließen"
+        },
+        "data_description": {
+          "diagnostics_enabled": "Wenn deaktiviert, enthält eine heruntergeladene Diagnose nur diese Einstellung, die gewählte Quelle und den Eintragsstatus."
+        }
+      }
     }
   }
 }
