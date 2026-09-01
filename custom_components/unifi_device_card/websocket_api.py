@@ -31,10 +31,16 @@ from .const import (
 from .runtime import DirectRuntime
 
 _POWER_CYCLE_TIMEOUT_SECONDS = 15.0
+_ADMIN_ROLES = {"admin", "administrator", "owner", "super_admin", "superadmin"}
+_POE_ACTIVE_MODES = {"auto", "pasv24", "passive24", "passthrough"}
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
     """Read a public property first and fall back to the raw UniFi payload."""
+    if isinstance(obj, Mapping):
+        value = obj.get(name)
+        return value if value is not None and value != "" else default
+
     try:
         value = getattr(obj, name)
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -119,6 +125,56 @@ def _nonnegative_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if 0 <= result < float("inf") else None
+
+
+def _poe_mode(port: Any) -> str:
+    """Return a normalized PoE mode from a port object or raw mapping."""
+    value = _value(port, "poe_mode", "")
+    text = str(getattr(value, "value", value) or "").strip().lower()
+    return text[:32]
+
+
+def _port_poe_capable(port: Any) -> bool | None:
+    """Combine the controller's PoE capability signals conservatively."""
+    port_poe = _value(port, "port_poe")
+    if port_poe is True:
+        return True
+
+    poe_caps = _positive_int(_value(port, "poe_caps"))
+    if poe_caps is not None:
+        return True
+
+    # Newer device payloads can omit port_poe while still exposing the active
+    # mode, enable flag, or power draw. Each is authoritative PoE evidence.
+    if _value(port, "poe_enable") is True:
+        return True
+    if _poe_mode(port) in _POE_ACTIVE_MODES:
+        return True
+    power = _nonnegative_float(_value(port, "poe_power"))
+    if power is not None and power > 0:
+        return True
+
+    if port_poe is False or _value(port, "poe_caps") == 0:
+        return False
+    return None
+
+
+def _port_poe_enabled(port: Any) -> bool | None:
+    """Return whether PoE delivery is enabled using current controller state."""
+    enabled = _value(port, "poe_enable")
+    if isinstance(enabled, bool):
+        return enabled
+
+    mode = _poe_mode(port)
+    if mode == "off":
+        return False
+    if mode in _POE_ACTIVE_MODES:
+        return True
+
+    power = _nonnegative_float(_value(port, "poe_power"))
+    if power is not None and power > 0:
+        return True
+    return None
 
 
 def _find_port(api: Any, target_mac: str, target_port: int) -> Any | None:
@@ -295,18 +351,17 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
             continue
         merged = {**raw_port, **overrides.get(port_idx, {})}
         vlan, vlan_source = _port_vlan(merged, network_index)
-        poe_capable = (
-            merged.get("port_poe")
-            if isinstance(merged.get("port_poe"), bool)
-            else None
-        )
-        poe_enabled = (
-            merged.get("poe_enable")
-            if isinstance(merged.get("poe_enable"), bool)
-            else None
-        )
-        poe_mode = str(merged.get("poe_mode") or "").strip().lower()[:32] or None
+        poe_capable = _port_poe_capable(merged)
+        poe_enabled = _port_poe_enabled(merged)
+        poe_mode = _poe_mode(merged) or None
         is_uplink = _port_is_uplink(device, merged, port_idx)
+        power_cycle_supported = bool(
+            poe_capable is True
+            and poe_enabled is True
+            and poe_mode != "off"
+            and not is_uplink
+            and raw.get("disabled") is not True
+        )
         ports.append(
             {
                 "port": port_idx,
@@ -324,13 +379,8 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
                 "poe_enabled": poe_enabled,
                 "poe_mode": poe_mode,
                 "poe_power_w": _nonnegative_float(merged.get("poe_power")),
-                "power_cycle_available": bool(
-                    poe_capable is True
-                    and poe_enabled is True
-                    and poe_mode != "off"
-                    and not is_uplink
-                    and raw.get("disabled") is not True
-                ),
+                "power_cycle_supported": power_cycle_supported,
+                "power_cycle_available": power_cycle_supported,
             }
         )
 
@@ -477,8 +527,16 @@ def _is_user_admin(connection: Any) -> bool:
 
 
 def _is_unifi_admin(hub: Any) -> bool:
-    """Honor the official UniFi integration's role flag when available."""
-    return getattr(hub, "is_admin", False) is True
+    """Honor the runtime flag and tolerate equivalent controller admin roles."""
+    if getattr(hub, "is_admin", False) is True:
+        return True
+
+    api = getattr(hub, "api", None)
+    for site in _items(getattr(api, "sites", None)):
+        role = str(_value(site, "role", "") or "").strip().lower()
+        if role in _ADMIN_ROLES:
+            return True
+    return False
 
 
 def _power_cycle_target_error(
@@ -489,11 +547,11 @@ def _power_cycle_target_error(
         return "device_unavailable", "The UniFi device is disabled"
     if _port_is_uplink(device, port, target_port):
         return "uplink_protected", "Power cycling an uplink port is not allowed"
-    if _value(port, "port_poe") is not True:
+    if _port_poe_capable(port) is not True:
         return "poe_unsupported", "This port does not report PoE capability"
-    if _value(port, "poe_enable") is not True:
+    if _port_poe_enabled(port) is not True:
         return "poe_disabled", "PoE is not currently active on this port"
-    if str(_value(port, "poe_mode", "") or "").strip().lower() == "off":
+    if _poe_mode(port) == "off":
         return "poe_disabled", "PoE is disabled on this port"
     return None
 
@@ -837,7 +895,7 @@ async def websocket_get_port_clients(
             )
             for port in source_ports:
                 port["power_cycle_available"] = bool(
-                    port.get("power_cycle_available") and power_cycle_allowed
+                    port.get("power_cycle_supported") and power_cycle_allowed
                 )
                 ports_by_number[port["port"]] = port
 

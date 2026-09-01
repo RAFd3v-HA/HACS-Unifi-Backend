@@ -823,6 +823,7 @@ class PowerCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(port["poe_enabled"])
         self.assertEqual(port["poe_mode"], "auto")
         self.assertEqual(port["poe_power_w"], 4.2)
+        self.assertTrue(port["power_cycle_supported"])
         self.assertTrue(port["power_cycle_available"])
         self.assertFalse(port["up"])
         self.assertEqual(connection.result[1]["clients"], [])
@@ -855,6 +856,39 @@ class PowerCycleTests(unittest.IsolatedAsyncioTestCase):
                 "port_idx": 16,
             },
         )
+
+    async def test_keeps_cycle_visible_when_pre_authorization_is_unavailable(self):
+        hass, _, _ = self._hass(unifi_admin=False)
+        connection = FakeConnection()
+
+        await API.websocket_get_port_clients(
+            hass,
+            connection,
+            {"id": 31, "device_mac": "aa:bb:cc:dd:ee:ff"},
+        )
+
+        port = connection.result[1]["ports"][0]
+        self.assertTrue(port["power_cycle_supported"])
+        self.assertFalse(port["power_cycle_available"])
+
+    def test_accepts_equivalent_poe_and_admin_evidence(self):
+        port = FakeItem(
+            {
+                "port_idx": 16,
+                "poe_caps": 35,
+                "poe_mode": "auto",
+                "poe_power": "9.54",
+            }
+        )
+        self.assertTrue(API._port_poe_capable(port))
+        self.assertTrue(API._port_poe_enabled(port))
+
+        site = FakeItem({"name": "default", "role": "owner"})
+        hub = types.SimpleNamespace(
+            is_admin=False,
+            api=types.SimpleNamespace(sites=FakeHandler({"default": site})),
+        )
+        self.assertTrue(API._is_unifi_admin(hub))
 
     async def test_rejects_non_admin_inactive_poe_and_uplink(self):
         hass, api, _ = self._hass()

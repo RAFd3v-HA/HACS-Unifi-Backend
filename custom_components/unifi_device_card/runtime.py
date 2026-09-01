@@ -29,6 +29,7 @@ _LOGIN_TIMEOUT_SECONDS = 15.0
 _REFRESH_TIMEOUT_SECONDS = 20.0
 _REFRESH_TTL_SECONDS = 10.0
 _DEFAULT_DETECTION_TIME = timedelta(minutes=5)
+_ADMIN_ROLES = {"admin", "administrator", "owner", "super_admin", "superadmin"}
 
 
 class DirectRuntimeError(Exception):
@@ -232,7 +233,8 @@ class DirectRuntime:
                 return False
 
             self.available = True
-            self.is_admin = str(getattr(selected_site, "role", "")).lower() == "admin"
+            role = str(getattr(selected_site, "role", "") or "").strip().lower()
+            self.is_admin = role in _ADMIN_ROLES
             self.last_refresh = time.time()
             self.last_error_code = (
                 "partial_refresh"
