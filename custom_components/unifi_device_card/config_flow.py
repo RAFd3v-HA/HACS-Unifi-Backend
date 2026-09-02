@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 from typing import Any
 
@@ -16,11 +18,18 @@ from homeassistant.const import (
     CONF_VERIFY_SSL,
 )
 from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from .connection import (
     CONF_SITE_ID,
     DirectAuthenticationError,
     DirectConnectionError,
+    DirectMfaAuthenticationError,
+    DirectMfaRequired,
     DirectSite,
     async_validate_direct_connection,
 )
@@ -28,6 +37,7 @@ from .const import (
     CONF_CONNECTION_MODE,
     CONF_DIAGNOSTICS_ENABLED,
     CONF_SITE_IDENTIFIER,
+    CONF_TOTP_SECRET,
     CONF_UNIFI_ENTRY_ID,
     CONNECTION_MODE_DIRECT,
     CONNECTION_MODE_OFFICIAL,
@@ -40,6 +50,22 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_MIN_TOTP_SECRET_LENGTH = 16
+
+
+def _normalize_totp_secret(value: Any) -> str:
+    """Normalize and validate a Base32 TOTP setup secret."""
+    secret = "".join(str(value).split()).upper().rstrip("=")
+    if len(secret) < _MIN_TOTP_SECRET_LENGTH:
+        raise ValueError
+
+    padded = secret + "=" * (-len(secret) % 8)
+    try:
+        base64.b32decode(padded, casefold=True)
+    except (binascii.Error, ValueError) as err:
+        raise ValueError from err
+    return secret
 
 
 class UnifiDeviceCardConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -161,6 +187,12 @@ class UnifiDeviceCardConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._direct_sites = await async_validate_direct_connection(
                     self.hass, self._direct_data
                 )
+            except DirectMfaRequired:
+                self._direct_data.pop(CONF_TOTP_SECRET, None)
+                return await self.async_step_mfa()
+            except DirectMfaAuthenticationError:
+                self._direct_data.pop(CONF_TOTP_SECRET, None)
+                return self._async_show_mfa_form(errors={"base": "invalid_mfa"})
             except DirectAuthenticationError:
                 errors["base"] = "invalid_auth"
             except DirectConnectionError:
@@ -198,6 +230,66 @@ class UnifiDeviceCardConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="direct",
             data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_mfa(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Collect the persistent TOTP setup secret for a direct login."""
+        if not self._direct_data:
+            return self.async_abort(reason="direct_validation_required")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                secret = _normalize_totp_secret(user_input[CONF_TOTP_SECRET])
+            except (KeyError, ValueError):
+                errors[CONF_TOTP_SECRET] = "invalid_mfa_secret"
+            else:
+                self._direct_data[CONF_TOTP_SECRET] = secret
+                try:
+                    self._direct_sites = await async_validate_direct_connection(
+                        self.hass, self._direct_data
+                    )
+                except (DirectMfaRequired, DirectMfaAuthenticationError):
+                    self._direct_data.pop(CONF_TOTP_SECRET, None)
+                    errors["base"] = "invalid_mfa"
+                except DirectAuthenticationError:
+                    self._direct_data.pop(CONF_TOTP_SECRET, None)
+                    errors["base"] = "invalid_auth"
+                except DirectConnectionError:
+                    self._direct_data.pop(CONF_TOTP_SECRET, None)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    self._direct_data.pop(CONF_TOTP_SECRET, None)
+                    _LOGGER.exception(
+                        "Unexpected error validating direct UniFi MFA login"
+                    )
+                    errors["base"] = "unknown"
+                else:
+                    if len(self._direct_sites) == 1:
+                        return await self.async_step_site(
+                            {CONF_SITE_IDENTIFIER: self._direct_sites[0].site_id}
+                        )
+                    return await self.async_step_site()
+
+        return self._async_show_mfa_form(errors=errors)
+
+    @callback
+    def _async_show_mfa_form(
+        self, *, errors: dict[str, str]
+    ) -> config_entries.ConfigFlowResult:
+        """Show the masked TOTP setup-secret form."""
+        return self.async_show_form(
+            step_id="mfa",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_TOTP_SECRET): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    )
+                }
+            ),
             errors=errors,
         )
 

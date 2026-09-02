@@ -13,8 +13,13 @@ import unittest
 def _install_home_assistant_stubs() -> None:
     """Install the small HA surface imported by the integration package."""
     voluptuous = types.ModuleType("voluptuous")
-    voluptuous.Required = lambda key: key
-    voluptuous.Optional = lambda key: key
+    voluptuous.Required = lambda key, **kwargs: key
+    voluptuous.Optional = lambda key, **kwargs: key
+    voluptuous.Schema = lambda schema: schema
+    voluptuous.All = lambda *validators: validators
+    voluptuous.Coerce = lambda value_type: value_type
+    voluptuous.Range = lambda **kwargs: kwargs
+    voluptuous.In = lambda values: values
     sys.modules.setdefault("voluptuous", voluptuous)
 
     websocket_api = types.ModuleType("homeassistant.components.websocket_api")
@@ -31,6 +36,31 @@ def _install_home_assistant_stubs() -> None:
     components = types.ModuleType("homeassistant.components")
     components.websocket_api = websocket_api
     config_entries = types.ModuleType("homeassistant.config_entries")
+
+    class _ConfigFlow:
+        def __init_subclass__(cls, **kwargs):
+            return super().__init_subclass__()
+
+        def async_show_form(self, **kwargs):
+            return {"type": "form", **kwargs}
+
+        def async_show_menu(self, **kwargs):
+            return {"type": "menu", **kwargs}
+
+        def async_abort(self, **kwargs):
+            return {"type": "abort", **kwargs}
+
+        def async_create_entry(self, **kwargs):
+            return {"type": "create_entry", **kwargs}
+
+        def async_update_reload_and_abort(self, entry, **kwargs):
+            return {"type": "abort", **kwargs}
+
+    class _OptionsFlow(_ConfigFlow):
+        pass
+
+    config_entries.ConfigFlow = _ConfigFlow
+    config_entries.OptionsFlow = _OptionsFlow
     config_entries.ConfigEntry = object
     core = types.ModuleType("homeassistant.core")
     core.HomeAssistant = object
@@ -48,6 +78,23 @@ def _install_home_assistant_stubs() -> None:
     exceptions.ConfigEntryNotReady = type("ConfigEntryNotReady", (Exception,), {})
     helpers = types.ModuleType("homeassistant.helpers")
     helpers.typing = typing_module
+    selector = types.ModuleType("homeassistant.helpers.selector")
+
+    class _TextSelectorType:
+        PASSWORD = "password"
+
+    class _TextSelectorConfig:
+        def __init__(self, **kwargs):
+            self.options = kwargs
+
+    class _TextSelector:
+        def __init__(self, config):
+            self.config = config
+
+    selector.TextSelector = _TextSelector
+    selector.TextSelectorConfig = _TextSelectorConfig
+    selector.TextSelectorType = _TextSelectorType
+    helpers.selector = selector
     homeassistant = types.ModuleType("homeassistant")
     homeassistant.components = components
     homeassistant.config_entries = config_entries
@@ -64,6 +111,7 @@ def _install_home_assistant_stubs() -> None:
         "homeassistant.core": core,
         "homeassistant.exceptions": exceptions,
         "homeassistant.helpers": helpers,
+        "homeassistant.helpers.selector": selector,
         "homeassistant.helpers.typing": typing_module,
     }
     for name, module in modules.items():
@@ -76,6 +124,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 CONNECTION = importlib.import_module("custom_components.unifi_device_card.connection")
 DIAGNOSTICS = importlib.import_module("custom_components.unifi_device_card.diagnostics")
 RUNTIME = importlib.import_module("custom_components.unifi_device_card.runtime")
+CONFIG_FLOW = importlib.import_module("custom_components.unifi_device_card.config_flow")
 
 
 class _FakeSession:
@@ -118,6 +167,7 @@ class ConnectionValidationTests(unittest.IsolatedAsyncioTestCase):
             "AiounifiException",
             "Unauthorized",
             "LoginRequired",
+            "TwoFaTokenRequired",
             "BadGateway",
             "Forbidden",
             "ServiceUnavailable",
@@ -223,6 +273,81 @@ class ConnectionValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.session.detached)
 
+    async def test_maps_local_mfa_challenge_to_dedicated_flow_error(self):
+        aiounifi = sys.modules["aiounifi"]
+        self.login_error = aiounifi.TwoFaTokenRequired()
+
+        with self.assertRaises(CONNECTION.DirectMfaRequired):
+            await CONNECTION.async_validate_direct_connection(
+                object(),
+                {
+                    "host": "controller",
+                    "username": "user",
+                    "password": "secret",
+                    "port": 443,
+                    "verify_ssl": True,
+                },
+            )
+
+        self.assertTrue(self.session.detached)
+
+    async def test_maps_sso_mfa_challenge_to_dedicated_flow_error(self):
+        aiounifi = sys.modules["aiounifi"]
+        self.login_error = aiounifi.RequestError(
+            "SSO MFA required but no totp_secret configured"
+        )
+
+        with self.assertRaises(CONNECTION.DirectMfaRequired):
+            await CONNECTION.async_validate_direct_connection(
+                object(),
+                {
+                    "host": "controller",
+                    "username": "user@example.com",
+                    "password": "secret",
+                    "port": 443,
+                    "verify_ssl": True,
+                },
+            )
+
+        self.assertTrue(self.session.detached)
+
+    async def test_passes_totp_secret_to_validation_configuration(self):
+        await CONNECTION.async_validate_direct_connection(
+            object(),
+            {
+                "host": "controller",
+                "username": "user",
+                "password": "secret",
+                "port": 443,
+                "verify_ssl": True,
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+            },
+        )
+
+        self.assertEqual(
+            self.controller_config.totp_secret, "JBSWY3DPEHPK3PXP"
+        )
+        self.assertTrue(self.session.detached)
+
+    async def test_rejected_totp_secret_has_specific_authentication_error(self):
+        aiounifi = sys.modules["aiounifi"]
+        self.login_error = aiounifi.Unauthorized()
+
+        with self.assertRaises(CONNECTION.DirectMfaAuthenticationError):
+            await CONNECTION.async_validate_direct_connection(
+                object(),
+                {
+                    "host": "controller",
+                    "username": "user",
+                    "password": "secret",
+                    "port": 443,
+                    "verify_ssl": True,
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            )
+
+        self.assertTrue(self.session.detached)
+
     async def test_direct_runtime_owns_session_until_unload(self):
         entry = types.SimpleNamespace(
             entry_id="backend-entry",
@@ -246,6 +371,29 @@ class ConnectionValidationTests(unittest.IsolatedAsyncioTestCase):
         await runtime.async_close()
         self.assertTrue(self.session.detached)
 
+    async def test_direct_runtime_reuses_saved_totp_secret(self):
+        entry = types.SimpleNamespace(
+            entry_id="backend-entry",
+            title="UniFi Device Card Backend",
+            data={
+                "host": "controller",
+                "username": "local-admin",
+                "password": "secret",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "port": 443,
+                "verify_ssl": False,
+                "site_id": "default",
+                "site_identifier": "site-a",
+            },
+        )
+
+        runtime = await RUNTIME.DirectRuntime.async_create(object(), entry)
+
+        self.assertEqual(
+            self.controller_config.totp_secret, "JBSWY3DPEHPK3PXP"
+        )
+        await runtime.async_close()
+
 
 class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     """Verify diagnostics never expose controller or client identities."""
@@ -257,6 +405,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 "host": "192.168.1.1",
                 "username": "admin",
                 "password": "secret",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
                 "verify_ssl": False,
                 "diagnostics_enabled": True,
             },
@@ -275,7 +424,92 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("192.168.1.1", serialized)
         self.assertNotIn("'admin'", serialized)
         self.assertNotIn("secret", serialized)
+        self.assertNotIn("JBSWY3DPEHPK3PXP", serialized)
         self.assertTrue(result["direct_fallback"]["credentials_configured"])
+
+
+class MfaConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Verify MFA is a dedicated masked step and persists the TOTP seed."""
+
+    def test_normalizes_base32_setup_secret_not_one_time_code(self):
+        self.assertEqual(
+            CONFIG_FLOW._normalize_totp_secret("jbsw y3dp ehpk 3pxp"),
+            "JBSWY3DPEHPK3PXP",
+        )
+        with self.assertRaises(ValueError):
+            CONFIG_FLOW._normalize_totp_secret("123456")
+
+    async def test_direct_login_challenge_opens_mfa_step(self):
+        original_validator = CONFIG_FLOW.async_validate_direct_connection
+
+        async def _requires_mfa(hass, data):
+            raise CONNECTION.DirectMfaRequired
+
+        CONFIG_FLOW.async_validate_direct_connection = _requires_mfa
+        try:
+            flow = CONFIG_FLOW.UnifiDeviceCardConfigFlow()
+            flow.hass = object()
+            result = await flow.async_step_direct(
+                {
+                    "host": "controller",
+                    "username": "user",
+                    "password": "secret",
+                    "port": 443,
+                    "verify_ssl": True,
+                    "diagnostics_enabled": True,
+                }
+            )
+        finally:
+            CONFIG_FLOW.async_validate_direct_connection = original_validator
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["step_id"], "mfa")
+        self.assertNotIn("totp_secret", flow._direct_data)
+
+    async def test_mfa_step_validates_and_persists_setup_secret(self):
+        original_validator = CONFIG_FLOW.async_validate_direct_connection
+
+        async def _accepts_mfa(hass, data):
+            return [
+                CONNECTION.DirectSite(
+                    site_id="site-a", api_name="default", description="Home"
+                )
+            ]
+
+        CONFIG_FLOW.async_validate_direct_connection = _accepts_mfa
+        try:
+            flow = CONFIG_FLOW.UnifiDeviceCardConfigFlow()
+            flow.hass = object()
+            flow._direct_data = {
+                "connection_mode": "direct",
+                "host": "controller",
+                "username": "user",
+                "password": "secret",
+                "port": 443,
+                "verify_ssl": True,
+                "diagnostics_enabled": True,
+            }
+            result = await flow.async_step_mfa(
+                {"totp_secret": "jbsw y3dp ehpk 3pxp"}
+            )
+        finally:
+            CONFIG_FLOW.async_validate_direct_connection = original_validator
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["data"]["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(result["data"]["site_id"], "default")
+
+    async def test_mfa_step_rejects_current_six_digit_code_locally(self):
+        flow = CONFIG_FLOW.UnifiDeviceCardConfigFlow()
+        flow.hass = object()
+        flow._direct_data = {"host": "controller"}
+
+        result = await flow.async_step_mfa({"totp_secret": "123456"})
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(
+            result["errors"]["totp_secret"], "invalid_mfa_secret"
+        )
 
 
 if __name__ == "__main__":

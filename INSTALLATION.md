@@ -37,8 +37,18 @@ bleiben ausschließlich im Home-Assistant-Config-Entry und werden niemals an
 Karte oder Browser weitergegeben. Für Schreibaktionen wie PoE-Neustart oder
 Etherlighting benötigt das UniFi-Konto Administratorrechte.
 
+Wenn der separate Login MFA verlangt, erscheint automatisch ein eigener,
+maskierter Schritt. Dort wird der Base32-TOTP-Einrichtungsschlüssel aus der
+Authenticator-Einrichtung eingetragen – nicht der aktuelle sechsstellige
+Einmalcode. Das Backend speichert diesen Schlüssel im Config-Entry, damit es
+sich nach einem Neustart selbstständig neu anmelden kann; Diagnosen enthalten
+ihn nicht. Eine reine Ubiquiti-Verify-/Push-Freigabe kann eine unbeaufsichtigte
+Sitzung nicht wiederholen. Nutze in diesem Fall die offizielle UniFi-Integration
+oder ein separates lokales Konto.
+
 **Konfigurieren** zeigt Quellenstatus und Diagnoseeinstellung. **Neu
-konfigurieren** wechselt die Quelle oder erneuert separate Zugangsdaten. Das
+konfigurieren** wechselt die Quelle oder erneuert separate Zugangsdaten samt
+TOTP-Einrichtungsschlüssel. Das
 Backend legt keine Dashboard-Karten an und verändert vorhandene
 Lovelace-Konfigurationen nicht automatisch.
 

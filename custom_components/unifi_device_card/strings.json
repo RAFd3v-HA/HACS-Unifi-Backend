@@ -12,6 +12,8 @@
     "error": {
       "cannot_connect": "Failed to connect to the UniFi Network controller.",
       "invalid_auth": "The UniFi Network controller rejected the username or password.",
+      "invalid_mfa": "The UniFi Network controller rejected the TOTP setup key. Check the Base32 key and Home Assistant's system time.",
+      "invalid_mfa_secret": "Enter the Base32 TOTP setup key, not the current six-digit one-time code.",
       "invalid_site": "Select a site returned by the validated controller.",
       "unknown": "An unexpected error occurred while validating the UniFi connection."
     },
@@ -67,6 +69,16 @@
           "password": "Stored only in Home Assistant's config entry. It is redacted from diagnostics.",
           "verify_ssl": "Enable this only when the controller certificate is trusted by Home Assistant.",
           "diagnostics_enabled": "Diagnostics contain status and counts, not credentials or network identities."
+        }
+      },
+      "mfa": {
+        "title": "Complete multi-factor authentication",
+        "description": "This separate UniFi account requires TOTP. Enter the Base32 setup key (the secret shown when the authenticator was enrolled), not the current six-digit code. Home Assistant stores it with the other config-entry credentials so the backend can authenticate again after a restart. Push approval is not supported because the controller session must be recreated automatically; use a TOTP authenticator or a local UniFi account without push-only MFA.",
+        "data": {
+          "totp_secret": "TOTP setup key"
+        },
+        "data_description": {
+          "totp_secret": "Base32 secret from the authenticator setup QR code or manual key. It is masked here, stored only in Home Assistant, and omitted from diagnostics."
         }
       },
       "site": {

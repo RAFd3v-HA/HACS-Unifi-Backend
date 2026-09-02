@@ -14,6 +14,12 @@ installations where the official integration cannot expose the required
 controller data. Credentials stay in the Home Assistant config entry and are
 never sent to the browser or card. A dedicated session is created only while
 that mode is selected; it is never opened silently beside the standard mode.
+If the account requires MFA, setup opens a separate masked step for the Base32
+TOTP setup secret—the secret shown during authenticator enrollment, not the
+current six-digit code. It is stored with the backend config entry so automatic
+login still works after restarts. Ubiquiti Verify/push-only approval cannot be
+replayed by an unattended controller session; use the official integration or
+a separate local UniFi account in that case.
 
 ## What it adds
 
@@ -46,8 +52,9 @@ and selects the correct controller by the device MAC requested by the card.
 
 Use **Configure** on the integration to view source status and enable or disable
 privacy-safe diagnostics. Use **Reconfigure** to change the source or separate
-login. Diagnostics never include credentials, client names, IP addresses, or
-MAC addresses. The backend deliberately does not create or edit Lovelace
+login, including a changed TOTP setup secret. Diagnostics never include the
+username, password, TOTP secret, client names, IP addresses, or MAC addresses.
+The backend deliberately does not create or edit Lovelace
 dashboards; card layout and device selection remain in the card editor.
 
 ## Privacy and scope
@@ -64,7 +71,8 @@ every Etherlighting change with a controller read-back before reporting success.
 PoE power cycle additionally requires canonical per-port PoE capability and is
 serialized per switch; it is never retried after an uncertain response. Standard-mode
 requests use the already authenticated controller session. Direct-fallback
-credentials remain backend-only and are redacted from diagnostics. SSH,
+credentials, including the optional TOTP setup secret, remain backend-only and
+are redacted from diagnostics. SSH,
 `/proc/led/*`, and `ubus` are never used.
 
 ## Compatibility
@@ -73,3 +81,5 @@ The integration deliberately does not install or pin `aiounifi`. It uses the
 version supplied by Home Assistant's official UniFi component. If Home
 Assistant changes that internal runtime interface, the backend reports itself
 unavailable and the card continues with its entity-only fallback.
+Direct-login MFA uses that library's TOTP support; interactive push approval is
+not supported because the backend must be able to authenticate unattended.

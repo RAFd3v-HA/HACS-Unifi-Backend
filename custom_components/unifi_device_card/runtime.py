@@ -20,8 +20,8 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 
-from .connection import CONF_SITE_ID
-from .const import CONF_SITE_IDENTIFIER, DEFAULT_DIRECT_SITE
+from .connection import CONF_SITE_ID, is_direct_mfa_required_error
+from .const import CONF_SITE_IDENTIFIER, CONF_TOTP_SECRET, DEFAULT_DIRECT_SITE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -123,15 +123,22 @@ class DirectRuntime:
         generic_errors = _exception_types(aiounifi, "AiounifiException")
 
         try:
+            configuration_data: dict[str, Any] = {
+                "host": str(data[CONF_HOST]).strip(),
+                "username": str(data[CONF_USERNAME]).strip(),
+                "password": str(data[CONF_PASSWORD]),
+                "port": int(data[CONF_PORT]),
+                "site": site,
+                "ssl_context": ssl_context,
+            }
+            if totp_secret := str(data.get(CONF_TOTP_SECRET) or "").strip():
+                # Omit the new keyword for legacy non-MFA entries so their
+                # existing aiounifi runtime path remains unchanged.
+                configuration_data[CONF_TOTP_SECRET] = totp_secret
             api = aiounifi.Controller(
                 Configuration(
                     session,
-                    host=str(data[CONF_HOST]).strip(),
-                    username=str(data[CONF_USERNAME]).strip(),
-                    password=str(data[CONF_PASSWORD]),
-                    port=int(data[CONF_PORT]),
-                    site=site,
-                    ssl_context=ssl_context,
+                    **configuration_data,
                 )
             )
             runtime = cls(
@@ -156,6 +163,8 @@ class DirectRuntime:
                 await runtime.async_close()
             elif not bool(getattr(session, "closed", False)):
                 session.detach()
+            if is_direct_mfa_required_error(aiounifi, err):
+                raise DirectRuntimeAuthenticationError from err
             if auth_errors and isinstance(err, auth_errors):
                 raise DirectRuntimeAuthenticationError from err
             if connection_errors and isinstance(err, connection_errors):

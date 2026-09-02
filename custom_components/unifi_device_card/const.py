@@ -9,6 +9,7 @@ CONF_CONNECTION_MODE: Final = "connection_mode"
 CONF_UNIFI_ENTRY_ID: Final = "unifi_entry_id"
 CONF_DIAGNOSTICS_ENABLED: Final = "diagnostics_enabled"
 CONF_SITE_IDENTIFIER: Final = "site_identifier"
+CONF_TOTP_SECRET: Final = "totp_secret"
 UNIFI_ENTRY_AUTO: Final = "auto"
 
 CONNECTION_MODE_OFFICIAL: Final = "official"

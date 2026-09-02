@@ -12,6 +12,8 @@
     "error": {
       "cannot_connect": "Die Verbindung zum UniFi-Network-Controller ist fehlgeschlagen.",
       "invalid_auth": "Der UniFi-Network-Controller hat Benutzername oder Passwort abgelehnt.",
+      "invalid_mfa": "Der UniFi-Network-Controller hat den TOTP-Einrichtungsschlüssel abgelehnt. Prüfe den Base32-Schlüssel und die Systemzeit von Home Assistant.",
+      "invalid_mfa_secret": "Gib den Base32-TOTP-Einrichtungsschlüssel ein, nicht den aktuellen sechsstelligen Einmalcode.",
       "invalid_site": "Wähle einen Standort, den der geprüfte Controller zurückgegeben hat.",
       "unknown": "Beim Prüfen der UniFi-Verbindung ist ein unerwarteter Fehler aufgetreten."
     },
@@ -67,6 +69,16 @@
           "password": "Wird ausschließlich im Config-Entry von Home Assistant gespeichert und in Diagnosen ausgeblendet.",
           "verify_ssl": "Nur aktivieren, wenn Home Assistant dem Zertifikat des Controllers vertraut.",
           "diagnostics_enabled": "Die Diagnose enthält Status und Anzahlen, aber keine Zugangsdaten oder Netzwerkidentitäten."
+        }
+      },
+      "mfa": {
+        "title": "Mehrstufige Anmeldung abschließen",
+        "description": "Dieses separate UniFi-Konto verlangt TOTP. Gib den Base32-Einrichtungsschlüssel ein, der beim Einrichten der Authenticator-App angezeigt wurde, nicht den aktuellen sechsstelligen Code. Home Assistant speichert ihn zusammen mit den übrigen Zugangsdaten des Config-Entries, damit sich das Backend nach einem Neustart erneut anmelden kann. Push-Freigaben werden nicht unterstützt, weil die Controller-Sitzung automatisch neu aufgebaut werden können muss; verwende einen TOTP-Authenticator oder ein lokales UniFi-Konto ohne reine Push-MFA.",
+        "data": {
+          "totp_secret": "TOTP-Einrichtungsschlüssel"
+        },
+        "data_description": {
+          "totp_secret": "Base32-Geheimnis aus dem QR-Code oder manuellen Schlüssel der Authenticator-Einrichtung. Es wird hier maskiert, nur in Home Assistant gespeichert und aus Diagnosen ausgeschlossen."
         }
       },
       "site": {

@@ -20,7 +20,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 
-from .const import DEFAULT_DIRECT_SITE
+from .const import CONF_TOTP_SECRET, DEFAULT_DIRECT_SITE
 
 CONF_SITE_ID = "site_id"
 
@@ -31,6 +31,14 @@ class DirectConnectionError(Exception):
 
 class DirectAuthenticationError(DirectConnectionError):
     """Raised when direct UniFi credentials are rejected."""
+
+
+class DirectMfaRequired(DirectAuthenticationError):
+    """Raised when direct UniFi authentication requires a TOTP secret."""
+
+
+class DirectMfaAuthenticationError(DirectAuthenticationError):
+    """Raised when direct UniFi MFA authentication is rejected."""
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,36 @@ def direct_api_config(data: Mapping[str, Any], site: str | None = None) -> dict[
         CONF_PORT: int(data[CONF_PORT]),
         CONF_VERIFY_SSL: bool(data.get(CONF_VERIFY_SSL, False)),
         CONF_SITE_ID: site or str(data.get(CONF_SITE_ID) or DEFAULT_DIRECT_SITE),
+        CONF_TOTP_SECRET: str(data.get(CONF_TOTP_SECRET) or "").strip(),
     }
+
+
+def _exception_types(module: Any, *names: str) -> tuple[type[BaseException], ...]:
+    """Return exception classes available in the installed aiounifi version."""
+    return tuple(
+        candidate
+        for name in names
+        if isinstance((candidate := getattr(module, name, None)), type)
+        and issubclass(candidate, BaseException)
+    )
+
+
+def is_direct_mfa_required_error(module: Any, err: BaseException) -> bool:
+    """Return whether aiounifi reported a local or SSO MFA challenge."""
+    two_fa_errors = _exception_types(module, "TwoFaTokenRequired")
+    if two_fa_errors and isinstance(err, two_fa_errors):
+        return True
+
+    # aiounifi 95 exposes a typed error for local MFA. UniFi OS SSO MFA without
+    # a configured seed is surfaced as a RequestError with this stable marker.
+    request_errors = _exception_types(module, "RequestError")
+    message = str(err).casefold()
+    return bool(
+        request_errors
+        and isinstance(err, request_errors)
+        and "mfa required" in message
+        and "totp_secret" in message
+    )
 
 
 async def async_validate_direct_connection(
@@ -82,15 +119,22 @@ async def async_validate_direct_connection(
     ssl_context = ssl.create_default_context() if verify_ssl else False
     api: Any | None = None
     try:
+        configuration_data: dict[str, Any] = {
+            "host": config[CONF_HOST],
+            "username": config[CONF_USERNAME],
+            "password": config[CONF_PASSWORD],
+            "port": config[CONF_PORT],
+            "site": config[CONF_SITE_ID],
+            "ssl_context": ssl_context,
+        }
+        if config[CONF_TOTP_SECRET]:
+            # Omit the new keyword for non-MFA entries so older Home Assistant
+            # aiounifi runtimes keep working exactly as before.
+            configuration_data[CONF_TOTP_SECRET] = config[CONF_TOTP_SECRET]
         api = aiounifi.Controller(
             Configuration(
                 session,
-                host=config[CONF_HOST],
-                username=config[CONF_USERNAME],
-                password=config[CONF_PASSWORD],
-                port=config[CONF_PORT],
-                site=config[CONF_SITE_ID],
-                ssl_context=ssl_context,
+                **configuration_data,
             )
         )
         async def _validate() -> None:
@@ -98,20 +142,33 @@ async def async_validate_direct_connection(
             await api.sites.update()
 
         await asyncio.wait_for(_validate(), timeout=10)
-    except (aiounifi.Unauthorized, aiounifi.LoginRequired) as err:
-        raise DirectAuthenticationError from err
-    except (
-        TimeoutError,
-        OSError,
-        aiounifi.BadGateway,
-        aiounifi.Forbidden,
-        aiounifi.ServiceUnavailable,
-        aiounifi.RequestError,
-        aiounifi.ResponseError,
-    ) as err:
-        raise DirectConnectionError from err
-    except aiounifi.AiounifiException as err:
-        raise DirectConnectionError from err
+    except Exception as err:
+        has_totp_secret = bool(config[CONF_TOTP_SECRET])
+        if is_direct_mfa_required_error(aiounifi, err):
+            if has_totp_secret:
+                raise DirectMfaAuthenticationError from err
+            raise DirectMfaRequired from err
+
+        auth_errors = _exception_types(aiounifi, "Unauthorized", "LoginRequired")
+        if auth_errors and isinstance(err, auth_errors):
+            if has_totp_secret:
+                raise DirectMfaAuthenticationError from err
+            raise DirectAuthenticationError from err
+
+        connection_errors = _exception_types(
+            aiounifi,
+            "BadGateway",
+            "Forbidden",
+            "ServiceUnavailable",
+            "RequestError",
+            "ResponseError",
+            "AiounifiException",
+        )
+        if isinstance(err, (TimeoutError, OSError)) or (
+            connection_errors and isinstance(err, connection_errors)
+        ):
+            raise DirectConnectionError from err
+        raise
     finally:
         session.detach()
 
