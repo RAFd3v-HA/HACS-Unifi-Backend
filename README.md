@@ -65,9 +65,12 @@ clients directly associated with that device. PoE power-cycle and Etherlighting
 writes are limited
 to Home Assistant administrators whose existing UniFi account is also an
 administrator. The backend requires the canonical capability reported by the
-official UniFi runtime, preserves all unknown controller fields, validates the
-mode, behavior and brightness values, serializes writes per device, and verifies
-every Etherlighting change with a controller read-back before reporting success.
+official UniFi runtime, re-reads the live device before every change, projects
+only the controller UI's validated write fields, validates mode, behavior and
+brightness, serializes writes per device, and verifies every Etherlighting
+change with an independent controller read-back before reporting success.
+The current native write contract is enabled only for UniFi Network 10.5.62 or
+newer within major version 10; other or unknown versions remain read-only.
 PoE power cycle additionally requires canonical per-port PoE capability and is
 serialized per switch; it is never retried after an uncertain response. Standard-mode
 requests use the already authenticated controller session. Direct-fallback

@@ -596,7 +596,19 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(API._etherlighting_patch({"brightness": True}))
         self.assertIsNone(API._etherlighting_patch({"brightness": 80.5}))
         self.assertIsNone(API._etherlighting_patch({"brightness": "80"}))
+        self.assertIsNone(API._etherlighting_patch({"led_mode": "etherlighting"}))
+        self.assertIsNone(API._etherlighting_patch({"brightness": 80, "mode": "speed"}))
         self.assertEqual(API._etherlighting_patch({"brightness": 80}), {"brightness": 80})
+        self.assertFalse(
+            API._etherlighting_payload_from_mapping(
+                {
+                    "led_mode": "etherlighting",
+                    "mode": "speed",
+                    "behavior": "steady",
+                    "brightness": "80",
+                }
+            )["supported"]
+        )
         self.assertFalse(API._is_unifi_admin(types.SimpleNamespace()))
         self.assertFalse(API._is_unifi_admin(types.SimpleNamespace(is_admin=None)))
         self.assertTrue(API._is_unifi_admin(types.SimpleNamespace(is_admin=True)))
@@ -615,6 +627,129 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(API._etherlighting_mapping(alias_only))
 
+        supported_api = types.SimpleNamespace(
+            system_information=FakeHandler(
+                {"sys": FakeItem({"version": "10.5.62"})}
+            )
+        )
+        old_api = types.SimpleNamespace(
+            system_information=FakeHandler(
+                {"sys": FakeItem({"version": "10.5.61"})}
+            )
+        )
+        future_major_api = types.SimpleNamespace(
+            system_information=FakeHandler(
+                {"sys": FakeItem({"version": "11.0.0"})}
+            )
+        )
+        self.assertTrue(API._etherlighting_network_version_supported(supported_api))
+        self.assertFalse(API._etherlighting_network_version_supported(old_api))
+        self.assertFalse(API._etherlighting_network_version_supported(future_major_api))
+
+    async def test_fresh_read_recovers_etherlighting_from_incomplete_cache(self):
+        device_mac = "aa:bb:cc:00:00:0a"
+        cached_device = FakeItem(
+            {
+                "mac": device_mac,
+                "device_id": "device-id-a",
+                "type": "usw",
+                "port_table": [],
+            }
+        )
+        live_device = {
+            **cached_device.raw,
+            "ether_lighting": {
+                "led_mode": "etherlighting",
+                "mode": "network",
+                "behavior": "steady",
+                "brightness": 42,
+            },
+            "config_network": {
+                "type": "dhcp",
+                "ip": "",
+                "netmask": "",
+                "gateway": "",
+                "dns1": "",
+                "dns2": "",
+                "dnssuffix": "",
+                "bonding_enabled": False,
+            },
+            "lcm_brightness": 80,
+            "lcm_brightness_override": False,
+            "lcm_night_mode_begins": "22:00",
+            "lcm_night_mode_ends": "07:00",
+            "lcm_orientation_override": "none",
+            "mgmt_network_id": "network-id",
+            "name": "Rack Switch",
+            "snmp_contact": "",
+            "snmp_location": "",
+            "stp_priority": "32768",
+        }
+
+        class RequestApi:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, request):
+                self.requests.append(request)
+                return {"data": [live_device]}
+
+        api = RequestApi()
+        api.devices = FakeHandler({device_mac: cached_device})
+        api.clients = FakeHandler()
+        api.object_oriented_network_configs = FakeHandler()
+        api.system_information = FakeHandler(
+            {"sys": FakeItem({"version": "10.5.62"})}
+        )
+        hub = types.SimpleNamespace(
+            api=api,
+            available=True,
+            is_admin=True,
+            site="default",
+            config=types.SimpleNamespace(option_detection_time=timedelta(minutes=5)),
+        )
+        entry = types.SimpleNamespace(
+            entry_id="unifi-entry", title="Home", runtime_data=hub
+        )
+        hass = types.SimpleNamespace(
+            data={}, config_entries=FakeConfigEntries([entry])
+        )
+
+        request_module = types.ModuleType("aiounifi.models.api")
+
+        class ApiRequest:
+            def __init__(self, method, path, data=None):
+                self.method = method
+                self.path = path
+                self.data = data
+
+        request_module.ApiRequest = ApiRequest
+        old_modules = {
+            key: sys.modules.get(key)
+            for key in ("aiounifi", "aiounifi.models", "aiounifi.models.api")
+        }
+        sys.modules["aiounifi"] = types.ModuleType("aiounifi")
+        sys.modules["aiounifi.models"] = types.ModuleType("aiounifi.models")
+        sys.modules["aiounifi.models.api"] = request_module
+        try:
+            connection = FakeConnection()
+            await API.websocket_get_port_clients(
+                hass, connection, {"id": 10, "device_mac": device_mac}
+            )
+        finally:
+            for key, value in old_modules.items():
+                if value is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = value
+
+        self.assertIsNone(connection.error)
+        self.assertTrue(connection.result[1]["etherlighting"]["supported"])
+        self.assertEqual(connection.result[1]["etherlighting"]["brightness"], 42)
+        self.assertTrue(connection.result[1]["etherlighting"]["writable"])
+        self.assertEqual(api.requests[0].method, "get")
+        self.assertEqual(api.requests[0].path, "/stat/device")
+
     async def test_exposes_and_updates_supported_etherlighting(self):
         device_mac = "aa:bb:cc:00:00:01"
         device = FakeItem(
@@ -624,12 +759,32 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
                 "type": "usw",
                 "port_table": [],
                 "ether_lighting": {
-                    "led_mode": "standard",
+                    "led_mode": "etherlighting",
                     "mode": "speed",
                     "behavior": "steady",
                     "brightness": 60,
                     "future_field": "preserved",
                 },
+                "config_network": {
+                    "type": "dhcp",
+                    "ip": "",
+                    "netmask": "",
+                    "gateway": "",
+                    "dns1": "",
+                    "dns2": "",
+                    "dnssuffix": "",
+                    "bonding_enabled": False,
+                },
+                "lcm_brightness": 80,
+                "lcm_brightness_override": False,
+                "lcm_night_mode_begins": "22:00",
+                "lcm_night_mode_ends": "07:00",
+                "lcm_orientation_override": "none",
+                "mgmt_network_id": "network-id",
+                "name": "Rack Switch",
+                "snmp_contact": "",
+                "snmp_location": "",
+                "stp_priority": "32768",
             }
         )
 
@@ -647,6 +802,9 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
         api.devices = FakeHandler({device_mac: device})
         api.clients = FakeHandler()
         api.object_oriented_network_configs = FakeHandler()
+        api.system_information = FakeHandler(
+            {"sys": FakeItem({"version": "10.5.62"})}
+        )
         hub = types.SimpleNamespace(
             api=api,
             available=True,
@@ -689,7 +847,6 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": 12,
                     "device_mac": device_mac,
-                    "led_mode": "etherlighting",
                     "brightness": 80,
                 },
             )
@@ -702,11 +859,15 @@ class WebsocketMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(connection.error)
         self.assertEqual(connection.result[1]["etherlighting"]["led_mode"], "etherlighting")
-        self.assertEqual(api.requests[0].method, "put")
-        self.assertEqual(api.requests[0].path, "/rest/device/device-id-1")
-        self.assertEqual(api.requests[0].data["ether_lighting"]["future_field"], "preserved")
-        self.assertEqual(api.requests[1].method, "get")
-        self.assertEqual(api.requests[1].path, "/stat/device")
+        self.assertTrue(connection.result[1]["etherlighting"]["writable"])
+        self.assertEqual(api.requests[0].method, "get")
+        self.assertEqual(api.requests[0].path, "/stat/device")
+        self.assertEqual(api.requests[1].method, "put")
+        self.assertEqual(api.requests[1].path, "/rest/device/device-id-1")
+        self.assertNotIn("future_field", api.requests[1].data["ether_lighting"])
+        self.assertEqual(api.requests[1].data["ether_lighting"]["brightness"], 80)
+        self.assertEqual(api.requests[2].method, "get")
+        self.assertEqual(api.requests[2].path, "/stat/device")
 
 
 class PowerCycleTests(unittest.IsolatedAsyncioTestCase):

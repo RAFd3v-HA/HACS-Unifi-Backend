@@ -19,6 +19,8 @@ from .const import (
     CONF_UNIFI_ENTRY_ID,
     CONNECTION_MODE_DIRECT,
     DATA_ETHERLIGHTING_LOCKS,
+    DATA_ETHERLIGHTING_STATUS_CACHE,
+    DATA_ETHERLIGHTING_STATUS_LOCKS,
     DATA_POWER_CYCLE_LOCKS,
     DEFAULT_CONNECTION_MODE,
     DOMAIN,
@@ -31,6 +33,9 @@ from .const import (
 from .runtime import DirectRuntime
 
 _POWER_CYCLE_TIMEOUT_SECONDS = 15.0
+_ETHERLIGHTING_STATUS_TTL_SECONDS = 30.0
+_ETHERLIGHTING_NETWORK_MAJOR = 10
+_ETHERLIGHTING_MIN_NETWORK_VERSION = (10, 5, 62)
 _ADMIN_ROLES = {"admin", "administrator", "owner", "super_admin", "superadmin"}
 _POE_ACTIVE_MODES = {"auto", "pasv24", "passive24", "passthrough"}
 
@@ -56,6 +61,8 @@ def _value(obj: Any, name: str, default: Any = None) -> Any:
 
 def _raw(obj: Any) -> Mapping[str, Any]:
     """Return an object's raw payload without depending on aiounifi classes."""
+    if isinstance(obj, Mapping):
+        return obj
     value = getattr(obj, "raw", None)
     return value if isinstance(value, Mapping) else {}
 
@@ -427,7 +434,29 @@ def _device_payload(api: Any, target_mac: str) -> tuple[dict[str, Any] | None, l
 
 _ETHERLIGHTING_MODES = {"speed", "network"}
 _ETHERLIGHTING_BEHAVIORS = {"steady", "breath"}
-_ETHERLIGHTING_LED_MODES = {"standard", "etherlighting"}
+_ETHERLIGHTING_LED_MODES = {"etherlighting"}
+_ETHERLIGHTING_CONFIG_NETWORK_FIELDS = (
+    "type",
+    "ip",
+    "netmask",
+    "gateway",
+    "dns1",
+    "dns2",
+    "dnssuffix",
+    "bonding_enabled",
+)
+_ETHERLIGHTING_TOP_LEVEL_FIELDS = (
+    "lcm_brightness",
+    "lcm_brightness_override",
+    "lcm_night_mode_begins",
+    "lcm_night_mode_ends",
+    "lcm_orientation_override",
+    "mgmt_network_id",
+    "name",
+    "snmp_contact",
+    "snmp_location",
+    "stp_priority",
+)
 
 
 def _bounded_int(value: Any, minimum: int, maximum: int) -> int | None:
@@ -443,6 +472,11 @@ def _bounded_int(value: Any, minimum: int, maximum: int) -> int | None:
     return number if minimum <= number <= maximum else None
 
 
+def _strict_bounded_int(value: Any, minimum: int, maximum: int) -> int | None:
+    """Accept an actual JSON integer in the inclusive range."""
+    return value if type(value) is int and minimum <= value <= maximum else None
+
+
 def _etherlighting_mapping(device: Any) -> tuple[str, dict[str, Any]] | None:
     """Return the canonical Etherlighting mapping for a supported switch."""
     raw = _raw(device)
@@ -456,14 +490,34 @@ def _etherlighting_mapping(device: Any) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _etherlighting_capability_hint(device: Any) -> bool:
+    """Return whether a switch advertises Etherlighting hardware."""
+    raw = _raw(device)
+    if isinstance(raw.get("ether_lighting"), Mapping):
+        return True
+    switch_caps = raw.get("switch_caps")
+    if not isinstance(switch_caps, Mapping):
+        return False
+    caps = _bounded_int(switch_caps.get("etherlight_caps"), 1, 2**31 - 1)
+    return caps is not None
+
+
 def _etherlighting_payload(device: Any) -> dict[str, Any] | None:
     """Expose a small, safe Etherlighting view without raw device data."""
     mapping = _etherlighting_mapping(device)
     if mapping is None:
+        if _etherlighting_capability_hint(device):
+            return {
+                "supported": False,
+                "reason": "configuration_unavailable",
+                "led_mode": None,
+                "mode": None,
+                "behavior": None,
+                "brightness": None,
+            }
         return None
 
-    payload = _etherlighting_payload_from_mapping(mapping[1])
-    return payload if payload["supported"] else None
+    return _etherlighting_payload_from_mapping(mapping[1])
 
 
 def _etherlighting_payload_from_mapping(source: Mapping[str, Any]) -> dict[str, Any]:
@@ -471,15 +525,20 @@ def _etherlighting_payload_from_mapping(source: Mapping[str, Any]) -> dict[str, 
     led_mode = str(source.get("led_mode") or "").strip().lower()
     mode = str(source.get("mode") or "").strip().lower()
     behavior = str(source.get("behavior") or "").strip().lower()
-    brightness = _bounded_int(source.get("brightness"), 1, 100)
-    supported = (
-        led_mode in _ETHERLIGHTING_LED_MODES
-        and mode in _ETHERLIGHTING_MODES
-        and behavior in _ETHERLIGHTING_BEHAVIORS
-        and brightness is not None
-    )
+    brightness = _strict_bounded_int(source.get("brightness"), 1, 100)
+    reason = "compatible"
+    if led_mode not in _ETHERLIGHTING_LED_MODES:
+        reason = "inactive_or_invalid_led_mode"
+    elif mode not in _ETHERLIGHTING_MODES:
+        reason = "invalid_mode"
+    elif behavior not in _ETHERLIGHTING_BEHAVIORS:
+        reason = "invalid_behavior"
+    elif brightness is None:
+        reason = "invalid_brightness"
+    supported = reason == "compatible"
     return {
         "supported": supported,
+        "reason": reason,
         "led_mode": led_mode if led_mode in _ETHERLIGHTING_LED_MODES else None,
         "mode": mode if mode in _ETHERLIGHTING_MODES else None,
         "behavior": behavior if behavior in _ETHERLIGHTING_BEHAVIORS else None,
@@ -491,7 +550,6 @@ def _etherlighting_patch(msg: Mapping[str, Any]) -> dict[str, Any] | None:
     """Validate the narrow set of Etherlighting controls exposed to the card."""
     patch: dict[str, Any] = {}
     for key, allowed in (
-        ("led_mode", _ETHERLIGHTING_LED_MODES),
         ("mode", _ETHERLIGHTING_MODES),
         ("behavior", _ETHERLIGHTING_BEHAVIORS),
     ):
@@ -508,7 +566,99 @@ def _etherlighting_patch(msg: Mapping[str, Any]) -> dict[str, Any] | None:
             return None
         patch["brightness"] = brightness
 
-    return patch or None
+    return patch if len(patch) == 1 else None
+
+
+def _etherlighting_write_payload(
+    device: Any, patch: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Build the bounded payload used by the native Network UI."""
+    if len(patch) != 1:
+        return None
+    raw = _raw(device)
+    mapping = _etherlighting_mapping(device)
+    config_network = raw.get("config_network")
+    if mapping is None or not isinstance(config_network, Mapping):
+        return None
+    _, current = mapping
+    if _etherlighting_payload_from_mapping(current)["supported"] is not True:
+        return None
+    if not all(field in current for field in ("mode", "brightness", "behavior", "led_mode")):
+        return None
+    if not all(field in config_network for field in _ETHERLIGHTING_CONFIG_NETWORK_FIELDS):
+        return None
+    if not all(field in raw for field in _ETHERLIGHTING_TOP_LEVEL_FIELDS):
+        return None
+
+    ether_lighting = {
+        field: deepcopy(current[field])
+        for field in ("mode", "brightness", "behavior", "led_mode")
+    }
+    ether_lighting.update(patch)
+    payload = {
+        field: deepcopy(raw[field]) for field in _ETHERLIGHTING_TOP_LEVEL_FIELDS
+    }
+    night_mode_enabled = raw.get("lcm_night_mode_enabled", False)
+    if not isinstance(night_mode_enabled, bool):
+        return None
+    payload["lcm_night_mode_enabled"] = night_mode_enabled
+    payload["config_network"] = {
+        field: deepcopy(config_network[field])
+        for field in _ETHERLIGHTING_CONFIG_NETWORK_FIELDS
+    }
+    payload["ether_lighting"] = ether_lighting
+    return payload
+
+
+def _etherlighting_write_contract_available(device: Any) -> bool:
+    """Return whether the live device has the complete native UI contract."""
+    mapping = _etherlighting_mapping(device)
+    if mapping is None:
+        return False
+    current = _etherlighting_payload_from_mapping(mapping[1])
+    mode = current.get("mode")
+    return bool(
+        current.get("supported") is True
+        and isinstance(mode, str)
+        and _etherlighting_write_payload(device, {"mode": mode}) is not None
+    )
+
+
+def _network_version(api: Any) -> str | None:
+    """Read the UniFi Network application version from aiounifi sysinfo."""
+    for item in _items(getattr(api, "system_information", None)):
+        value = str(_value(item, "version", "") or "").strip()
+        if value:
+            return value[:64]
+    return None
+
+
+def _network_version_tuple(value: Any) -> tuple[int, int, int] | None:
+    """Parse the numeric major/minor/patch prefix of a Network version."""
+    parts = str(value or "").strip().split(".")
+    if len(parts) < 3:
+        return None
+    parsed: list[int] = []
+    for part in parts[:3]:
+        digits = ""
+        for char in part:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            return None
+        parsed.append(int(digits))
+    return tuple(parsed)  # type: ignore[return-value]
+
+
+def _etherlighting_network_version_supported(api: Any) -> bool:
+    """Restrict native Etherlighting writes to the validated Network release."""
+    version = _network_version_tuple(_network_version(api))
+    return bool(
+        version is not None
+        and version[0] == _ETHERLIGHTING_NETWORK_MAJOR
+        and version >= _ETHERLIGHTING_MIN_NETWORK_VERSION
+    )
 
 
 def _device_id(device: Any) -> str:
@@ -556,10 +706,10 @@ def _power_cycle_target_error(
     return None
 
 
-def _verified_etherlighting_mapping(
+def _verified_etherlighting_device(
     response: Any, target_mac: str
 ) -> Mapping[str, Any] | None:
-    """Read the selected device's canonical Etherlighting data from a REST result."""
+    """Read the selected device from a canonical REST result."""
     if not isinstance(response, Mapping):
         return None
     records = response.get("data")
@@ -570,9 +720,100 @@ def _verified_etherlighting_mapping(
             continue
         if _normalize_mac(record.get("mac")) != target_mac:
             continue
-        value = record.get("ether_lighting")
-        return value if isinstance(value, Mapping) else None
+        return record
     return None
+
+
+def _verified_etherlighting_mapping(
+    response: Any, target_mac: str
+) -> Mapping[str, Any] | None:
+    """Read the selected device's canonical Etherlighting data from a REST result."""
+    record = _verified_etherlighting_device(response, target_mac)
+    if record is None:
+        return None
+    value = record.get("ether_lighting")
+    return value if isinstance(value, Mapping) else None
+
+
+def _etherlighting_status_record(device: Any) -> dict[str, Any] | None:
+    """Build a sanitized status record from one cached or live device."""
+    status = _etherlighting_payload(device)
+    if status is None:
+        return None
+    return {
+        "status": status,
+        "write_contract": _etherlighting_write_contract_available(device),
+    }
+
+
+async def _async_live_etherlighting_statuses(
+    hass: HomeAssistant, entry: Any, api: Any
+) -> Mapping[str, Mapping[str, Any]]:
+    """Fetch and briefly cache sanitized Etherlighting state for all switches."""
+    request_method = getattr(api, "request", None)
+    if not callable(request_method):
+        return {}
+
+    entry_id = str(getattr(entry, "entry_id", "") or "unknown")
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    caches = domain_data.setdefault(DATA_ETHERLIGHTING_STATUS_CACHE, {})
+    locks = domain_data.setdefault(DATA_ETHERLIGHTING_STATUS_LOCKS, {})
+    now = time.monotonic()
+    cached = caches.get(entry_id)
+    if isinstance(cached, Mapping) and float(cached.get("expires", 0)) > now:
+        devices = cached.get("devices")
+        return devices if isinstance(devices, Mapping) else {}
+
+    lock = locks.setdefault(entry_id, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        cached = caches.get(entry_id)
+        if isinstance(cached, Mapping) and float(cached.get("expires", 0)) > now:
+            devices = cached.get("devices")
+            return devices if isinstance(devices, Mapping) else {}
+
+        try:
+            from aiounifi.models.api import ApiRequest
+
+            response = await request_method(ApiRequest(method="get", path="/stat/device"))
+        except Exception:
+            return {}
+
+        records = response.get("data") if isinstance(response, Mapping) else None
+        statuses: dict[str, Mapping[str, Any]] = {}
+        if isinstance(records, list):
+            for device in records:
+                if not isinstance(device, Mapping):
+                    continue
+                mac = _normalize_mac(device.get("mac"))
+                if not mac or str(device.get("type") or "").strip().lower() != "usw":
+                    continue
+                record = _etherlighting_status_record(device)
+                if record is not None:
+                    statuses[mac] = record
+
+        caches[entry_id] = {
+            "expires": now + _ETHERLIGHTING_STATUS_TTL_SECONDS,
+            "devices": statuses,
+        }
+        return statuses
+
+
+def _etherlighting_write_access(
+    connection: Any, hub: Any, api: Any, write_contract: bool
+) -> tuple[bool, str]:
+    """Return the effective write permission and a stable UI reason."""
+    if not _is_user_admin(connection) or not _is_unifi_admin(hub):
+        return False, "admin_required"
+    if getattr(hub, "available", False) is not True or not callable(
+        getattr(api, "request", None)
+    ):
+        return False, "controller_unavailable"
+    if not _etherlighting_network_version_supported(api):
+        return False, "unsupported_network_version"
+    if not write_contract:
+        return False, "write_contract_unavailable"
+    return True, "compatible"
 
 
 def _etherlighting_patch_matches(
@@ -580,7 +821,9 @@ def _etherlighting_patch_matches(
 ) -> bool:
     """Confirm the controller returned every requested normalized value."""
     normalized = _etherlighting_payload_from_mapping(source)
-    return normalized["supported"] and all(normalized.get(key) == value for key, value in patch.items())
+    return normalized["supported"] and all(
+        normalized.get(key) == value for key, value in patch.items()
+    )
 
 
 def _client_payload(client: Any) -> dict[str, Any]:
@@ -901,7 +1144,56 @@ async def websocket_get_port_clients(
 
             if etherlighting is None:
                 device = _find_device(api, target_mac)
-                etherlighting = _etherlighting_payload(device) if device is not None else None
+                cached_record = (
+                    _etherlighting_status_record(device) if device is not None else None
+                )
+                device_type = str(_value(device, "type", "") or "").strip().lower()
+                cached_status = (
+                    cached_record.get("status")
+                    if isinstance(cached_record, Mapping)
+                    else None
+                )
+                needs_live_read = bool(
+                    device_type == "usw"
+                    and (
+                        cached_record is None
+                        or (
+                            isinstance(cached_status, Mapping)
+                            and cached_status.get("reason") == "configuration_unavailable"
+                        )
+                        or (
+                            isinstance(cached_status, Mapping)
+                            and cached_status.get("supported") is True
+                            and cached_record.get("write_contract") is not True
+                        )
+                    )
+                )
+                if needs_live_read:
+                    live_records = await _async_live_etherlighting_statuses(
+                        hass, entry, api
+                    )
+                    live_record = live_records.get(target_mac)
+                    if isinstance(live_record, Mapping):
+                        cached_record = live_record
+
+                if isinstance(cached_record, Mapping):
+                    status = cached_record.get("status")
+                    if isinstance(status, Mapping):
+                        etherlighting = dict(status)
+                        writable, write_reason = _etherlighting_write_access(
+                            connection,
+                            hub,
+                            api,
+                            cached_record.get("write_contract") is True,
+                        )
+                        etherlighting["writable"] = bool(
+                            etherlighting.get("supported") is True and writable
+                        )
+                        etherlighting["write_reason"] = (
+                            write_reason
+                            if etherlighting.get("supported") is True
+                            else str(etherlighting.get("reason") or "incompatible")
+                        )
 
         for client in _items(getattr(api, "clients", None)):
             if not _client_is_current(client, hub):
@@ -1127,7 +1419,6 @@ async def websocket_power_cycle_poe(
     {
         vol.Required("type"): WS_TYPE_SET_ETHERLIGHTING,
         vol.Required("device_mac"): str,
-        vol.Optional("led_mode"): str,
         vol.Optional("mode"): str,
         vol.Optional("behavior"): str,
         vol.Optional("brightness"): object,
@@ -1173,49 +1464,71 @@ async def websocket_set_etherlighting(
             )
             return
 
-        mapping = _etherlighting_mapping(device)
-        device_id = _device_id(device)
         request_method = getattr(api, "request", None)
-        if mapping is None or not device_id or not callable(request_method):
+        if getattr(hub, "available", False) is not True or not callable(request_method):
             connection.send_error(
                 msg["id"],
-                "etherlighting_unsupported",
-                "This device or UniFi runtime does not expose Etherlighting controls",
+                "device_unavailable",
+                "UniFi is not connected or does not expose device controls",
+            )
+            return
+        if not _etherlighting_network_version_supported(api):
+            connection.send_error(
+                msg["id"],
+                "etherlighting_version_unsupported",
+                "This UniFi Network version is not validated for Etherlighting writes",
             )
             return
 
         domain_data = hass.data.setdefault(DOMAIN, {})
         locks = domain_data.setdefault(DATA_ETHERLIGHTING_LOCKS, {})
-        lock_key = f"{entry.entry_id}:{device_id}"
+        lock_key = f"{entry.entry_id}:{target_mac}"
         lock = locks.setdefault(lock_key, asyncio.Lock())
 
         async with lock:
-            # Re-read the live object after waiting so two cards cannot merge
-            # their changes from the same stale snapshot.
-            device = _find_device(api, target_mac)
-            mapping = _etherlighting_mapping(device) if device is not None else None
-            if mapping is None:
+            if (
+                not _is_unifi_admin(hub)
+                or getattr(hub, "available", False) is not True
+                or not _etherlighting_network_version_supported(api)
+            ):
                 connection.send_error(
                     msg["id"],
-                    "etherlighting_unsupported",
-                    "The canonical Etherlighting device payload is no longer available",
+                    "device_unavailable",
+                    "UniFi is no longer available for Etherlighting control",
                 )
                 return
-
-            _, current = mapping
-            merged = deepcopy(current)
-            merged.update(patch)
-
             try:
                 # ApiRequest is intentionally imported lazily: the companion
                 # consumes the aiounifi runtime already owned by Home Assistant.
                 from aiounifi.models.api import ApiRequest
 
-                path = f"/rest/device/{device_id}"
+                current_response = await request_method(
+                    ApiRequest(method="get", path="/stat/device")
+                )
+                current_device = _verified_etherlighting_device(
+                    current_response, target_mac
+                )
+                write_payload = (
+                    _etherlighting_write_payload(current_device, patch)
+                    if current_device is not None
+                    else None
+                )
+                current_device_id = (
+                    _device_id(current_device) if current_device is not None else ""
+                )
+                if write_payload is None or not current_device_id:
+                    connection.send_error(
+                        msg["id"],
+                        "etherlighting_unsupported",
+                        "The live Etherlighting write contract is unavailable",
+                    )
+                    return
+
+                path = f"/rest/device/{current_device_id}"
                 request = ApiRequest(
                     method="put",
                     path=path,
-                    data={"ether_lighting": merged},
+                    data=write_payload,
                 )
                 await request_method(request)
 
@@ -1256,6 +1569,14 @@ async def websocket_set_etherlighting(
                 return
 
         result = _etherlighting_payload_from_mapping(verified)
+        result["writable"] = True
+        result["write_reason"] = "compatible"
+        # A successful write invalidates the short live-read cache. The result
+        # itself is returned immediately, while the next card refresh re-reads
+        # canonical controller state.
+        domain_data.setdefault(DATA_ETHERLIGHTING_STATUS_CACHE, {}).pop(
+            entry.entry_id, None
+        )
         connection.send_result(
             msg["id"],
             {

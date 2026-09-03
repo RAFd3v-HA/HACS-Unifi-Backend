@@ -62,5 +62,9 @@ den gewählten Port eindeutig als PoE-fähig und aktiviert meldet; dafür sind
 Administratorrechte in Home Assistant und UniFi erforderlich.
 Etherlighting wird nur bei Geräten angezeigt, die der UniFi-Controller als
 fähig meldet. Änderungen an Etherlighting sind auf Home-Assistant- und UniFi-
-Administratoren beschränkt; auf nicht unterstützten Geräten bleibt die Karte
-unverändert.
+Administratoren beschränkt. Meldet die Hardware Etherlighting, aber keine
+kompatible Konfiguration, zeigt die Karte einen Diagnosehinweis; nicht
+unterstützte Geräte bleiben unverändert.
+Der Schreibpfad ist für UniFi Network 10 ab Version 10.5.62 validiert. Bei einer
+anderen oder nicht ermittelbaren Network-Version bleibt Etherlighting sichtbar,
+aber schreibgeschützt.

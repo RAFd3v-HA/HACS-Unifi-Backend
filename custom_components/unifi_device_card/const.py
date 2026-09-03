@@ -25,4 +25,6 @@ WS_TYPE_POWER_CYCLE_POE: Final = "unifi_device_card/power_cycle_poe"
 
 DATA_WEBSOCKET_REGISTERED: Final = "websocket_registered"
 DATA_ETHERLIGHTING_LOCKS: Final = "etherlighting_locks"
+DATA_ETHERLIGHTING_STATUS_CACHE: Final = "etherlighting_status_cache"
+DATA_ETHERLIGHTING_STATUS_LOCKS: Final = "etherlighting_status_locks"
 DATA_POWER_CYCLE_LOCKS: Final = "power_cycle_locks"
